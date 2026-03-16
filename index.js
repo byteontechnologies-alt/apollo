@@ -35,6 +35,9 @@ async function runAgentCycle({dryRun=false}={}){if(agentRunning)return;agentRunn
 function startScheduler(){cron.schedule('0 9 * * 1-5',()=>runAgentCycle());cron.schedule('0 14 * * 1-5',()=>runAgentCycle());cron.schedule('*/15 * * * *',()=>checkForReplies());dbLog('📅','Scheduler active','9am+2pm weekdays, reply check every 15min');}
 const app=express();
 app.use(cors());app.use(express.json());
+app.get("/", (req, res) => {
+  res.send("🚀 LeadForge Apollo API Running");
+});
 app.get('/healthz',(req,res)=>res.status(200).send('OK'));
 app.get('/api/stats',(req,res)=>res.json(getStats()));
 app.get('/api/leads',(req,res)=>res.json(getAllLeads()));
