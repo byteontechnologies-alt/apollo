@@ -1,5 +1,7 @@
 require('dotenv').config();
-const express=require('express'),cors=require('cors'),axios=require('axios'),nodemailer=require('nodemailer'),Imap=require('imap'),{simpleParser}=require('mailparser'),cron=require('node-cron'),path=require('path'),fs=require('fs'),low=require('lowdb'),FileSync=require('lowdb/adapters/FileSync');
+const express=require('express'),cors=require('cors'),axios=require('axios'),nodemailer=require('nodemailer'),Imap=require('imap'),{simpleParser}=require('mailparser'),cron=require('node-cron'),path=require('path'),fs=require('fs'),low=require('lowdb'),FileSync=require('lowdb/adapters/FileSync'),multer=require('multer'),csvParser=require('csv-parser');
+
+// ── Database ──────────────────────────────────────────────────────────────
 const DATA_DIR=path.join(__dirname,'data');
 if(!fs.existsSync(DATA_DIR))fs.mkdirSync(DATA_DIR,{recursive:true});
 const db=low(new FileSync(path.join(DATA_DIR,'leadforge.json')));
@@ -21,20 +23,221 @@ function insertEmail(d){const id=nextId('emails');db.get('emails').push({id,cont
 function dbLog(icon,title,detail){console.log(`[${icon}] ${title}${detail?' — '+detail:''}`);const id=nextId('activity_log');db.get('activity_log').push({id,icon,title,detail:detail||'',created_at:new Date().toISOString()}).write();}
 function getRecentActivity(limit=50){return db.get('activity_log').value().slice(-limit).reverse();}
 function getStats(){const l=db.get('leads').value(),c=db.get('contacts').value(),e=db.get('emails').value();return{total_leads:l.length,total_contacts:c.length,emails_found:c.filter(x=>x.email).length,contacted:c.filter(x=>x.emails_sent>0).length,total_sent:c.reduce((a,x)=>a+(x.emails_sent||0),0),followups_due:c.filter(x=>x.status==='followup').length,total_replies:c.filter(x=>x.status==='replied').length,emails_out:e.filter(x=>x.direction==='out').length};}
-const TPLS={1:{sub:'IT Staff Augmentation for {{company_name}}?',body:'Hi {{first_name}},\n\nI noticed {{company_name}} is actively building its tech team.\n\nWe help US companies staff up with pre-vetted IT professionals (React, Node.js, Python, DevOps, QA) ready in 5–7 business days — 40–60% less than full-time hiring.\n\nOpen to a quick 15-min call this week?\n\nBest,\n{{your_name}}\n{{your_company}}\n{{your_phone}} · {{your_website}}'},2:{sub:'Re: IT Staff Augmentation for {{company_name}}?',body:'Hi {{first_name}},\n\nFollowing up — we recently helped a SaaS company stand up a 3-person React + Node team in under a week.\n\nWorth a 15-min call?\n\n{{your_name}}\n{{your_company}}'},3:{sub:'One more thought — {{company_name}}',body:'Hi {{first_name}},\n\nOur clients say the biggest win is scaling back down just as fast — no layoffs, no notice periods.\n\nHappy to send a one-pager.\n\n{{your_name}}\n{{your_company}}'},4:{sub:'Closing the loop — {{company_name}}',body:'Hi {{first_name}},\n\nI\'ll leave it here — if IT staffing needs come up, feel free to reach out anytime.\n\nWishing {{company_name}} all the best.\n\n{{your_name}}\n{{your_company}}'}};
+
+// ── Email templates ───────────────────────────────────────────────────────
+const TPLS={1:{sub:'IT Staff Augmentation for {{company_name}}?',body:'Hi {{first_name}},\n\nI noticed {{company_name}} is actively building its tech team.\n\nWe help US companies staff up with pre-vetted IT professionals (React, Node.js, Python, DevOps, QA) ready in 5-7 business days — 40-60% less than full-time hiring.\n\nOpen to a quick 15-min call this week?\n\nBest,\n{{your_name}}\n{{your_company}}\n{{your_phone}} · {{your_website}}'},2:{sub:'Re: IT Staff Augmentation for {{company_name}}?',body:'Hi {{first_name}},\n\nFollowing up — we recently helped a SaaS company stand up a 3-person React + Node team in under a week.\n\nWorth a 15-min call?\n\n{{your_name}}\n{{your_company}}'},3:{sub:'One more thought — {{company_name}}',body:'Hi {{first_name}},\n\nOur clients say the biggest win is scaling back down just as fast — no layoffs, no notice periods.\n\nHappy to send a one-pager.\n\n{{your_name}}\n{{your_company}}'},4:{sub:'Closing the loop — {{company_name}}',body:'Hi {{first_name}},\n\nI\'ll leave it here — if IT staffing needs come up, feel free to reach out anytime.\n\nWishing {{company_name}} all the best.\n\n{{your_name}}\n{{your_company}}'}};
 function fillTpl(t,v){let s=t.sub,b=t.body;for(const[k,val]of Object.entries(v)){s=s.replaceAll(`{{${k}}}`,val||'');b=b.replaceAll(`{{${k}}}`,val||'');}return{subject:s,body:b};}
-function makeTransport(){return nodemailer.createTransport({host:process.env.SMTP_HOST||'smtp.hostinger.com',port:parseInt(process.env.SMTP_PORT)||465,secure:(process.env.SMTP_PORT||'465')==='465',auth:{user:process.env.SMTP_USER,pass:process.env.SMTP_PASS},connectionTimeout:10000,greetingTimeout:10000,socketTimeout:10000});}
-async function testSmtp(){try{await makeTransport().verify();dbLog('✅','SMTP connected',process.env.SMTP_USER);return{ok:true};}catch(e){dbLog('❌','SMTP failed',e.message);return{ok:false,error:e.message};}}
-async function sendEmail({contact,lead,emailNum=1,dryRun=false}){const t=TPLS[emailNum]||TPLS[1];const{subject,body}=fillTpl(t,{first_name:contact.first_name||contact.name?.split(' ')[0]||'there',company_name:lead.company,role:contact.role,your_name:process.env.SMTP_FROM_NAME||'Your Name',your_company:process.env.YOUR_COMPANY||'',your_phone:process.env.YOUR_PHONE||'',your_website:process.env.YOUR_WEBSITE||''});if(dryRun){dbLog('👁','DRY RUN',`To:${contact.email}|${subject}`);return{ok:true,dryRun:true,subject,body};}try{const info=await makeTransport().sendMail({from:`"${process.env.SMTP_FROM_NAME}"<${process.env.SMTP_USER}>`,to:contact.email,subject,text:body});insertEmail({contact_id:contact.id,lead_id:lead.id||contact.lead_id,direction:'out',subject,body,from_addr:process.env.SMTP_USER,to_addr:contact.email,template_num:emailNum,message_id:info.messageId});markContactSent(contact.id);dbLog('📤',`Email #${emailNum} sent`,`${lead.company}→${contact.name}`);return{ok:true,messageId:info.messageId};}catch(e){dbLog('❌','Send failed',e.message);return{ok:false,error:e.message};}}
-async function sendNotif({contactName,companyName,replyBody}){if(!process.env.NOTIFY_EMAIL)return;try{await makeTransport().sendMail({from:`"LeadForge"<${process.env.SMTP_USER}>`,to:process.env.NOTIFY_EMAIL,subject:`Reply from ${companyName} — ${contactName}`,text:`New reply!\n\nCompany:${companyName}\nContact:${contactName}\n\n${replyBody||''}`});}catch(e){}}
+
+// ── SMTP ──────────────────────────────────────────────────────────────────
+// ── Gmail API (OAuth2 — no SMTP port blocking) ───────────────────────────
+const {google} = require('googleapis');
+
+function getOAuth2Client(){
+  const client = new google.auth.OAuth2(
+    process.env.GMAIL_CLIENT_ID,
+    process.env.GMAIL_CLIENT_SECRET,
+    process.env.GMAIL_REDIRECT_URI||'https://apollo-production-7a77.up.railway.app/auth/callback'
+  );
+  if(process.env.GMAIL_REFRESH_TOKEN){
+    client.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
+  }
+  return client;
+}
+
+function makeRawEmail({to, toName, subject, body, fromName, fromEmail}){
+  const msg = [
+    `From: "${fromName}" <${fromEmail}>`,
+    `To: ${toName?`"${toName}" <${to}>`:to}`,
+    `Subject: ${subject}`,
+    `MIME-Version: 1.0`,
+    `Content-Type: text/plain; charset=utf-8`,
+    ``,
+    body
+  ].join('\r\n');
+  return Buffer.from(msg).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+
+async function gmailSend({to, toName, subject, body}){
+  const auth = getOAuth2Client();
+  const gmail = google.gmail({version:'v1', auth});
+  const raw = makeRawEmail({
+    to, toName, subject, body,
+    fromName: process.env.SMTP_FROM_NAME||'LeadForge',
+    fromEmail: process.env.GMAIL_SEND_AS||process.env.SMTP_USER
+  });
+  const r = await gmail.users.messages.send({ userId:'me', requestBody:{ raw } });
+  return r.data;
+}
+
+async function testSmtp(){
+  if(!process.env.GMAIL_REFRESH_TOKEN){
+    return {ok:false, error:'Not authorised yet — visit /auth/start to connect your Gmail account'};
+  }
+  try {
+    const auth = getOAuth2Client();
+    const gmail = google.gmail({version:'v1', auth});
+    const profile = await gmail.users.getProfile({userId:'me'});
+    dbLog('✅','Gmail API connected', profile.data.emailAddress);
+    return {ok:true, email: profile.data.emailAddress};
+  } catch(e) {
+    dbLog('❌','Gmail API failed', e.message);
+    return {ok:false, error: e.message};
+  }
+}
+
+async function sendEmail({contact,lead,emailNum=1,dryRun=false}){
+  const t=TPLS[emailNum]||TPLS[1];
+  const{subject,body}=fillTpl(t,{
+    first_name:contact.first_name||contact.name?.split(' ')[0]||'there',
+    company_name:lead.company, role:contact.role,
+    your_name:process.env.SMTP_FROM_NAME||'Your Name',
+    your_company:process.env.YOUR_COMPANY||'',
+    your_phone:process.env.YOUR_PHONE||'',
+    your_website:process.env.YOUR_WEBSITE||''
+  });
+  if(dryRun){dbLog('👁','DRY RUN',`To:${contact.email}|${subject}`);return{ok:true,dryRun:true,subject,body};}
+  try {
+    await gmailSend({to:contact.email, toName:contact.name, subject, body});
+    insertEmail({contact_id:contact.id,lead_id:lead.id||contact.lead_id,direction:'out',subject,body,from_addr:process.env.SMTP_USER,to_addr:contact.email,template_num:emailNum,message_id:null});
+    markContactSent(contact.id);
+    dbLog('📤',`Email #${emailNum} sent`,`${lead.company}→${contact.name}`);
+    return{ok:true};
+  } catch(e){
+    dbLog('❌','Send failed',e.message);
+    return{ok:false,error:e.message};
+  }
+}
+
+async function sendNotif({contactName,companyName,replyBody}){
+  if(!process.env.NOTIFY_EMAIL) return;
+  try {
+    await gmailSend({
+      to: process.env.NOTIFY_EMAIL,
+      subject: `Reply from ${companyName} — ${contactName}`,
+      body: `New reply!\n\nCompany: ${companyName}\nContact: ${contactName}\n\n${replyBody||''}`
+    });
+  } catch(e){}
+}
 function delay(s){return new Promise(r=>setTimeout(r,Math.max(5000,(s+(Math.random()-.5)*60)*1000)));}
-async function importLeadsFromApollo(){const titles=(process.env.APOLLO_TITLES||'CTO,VP Engineering,IT Manager,HR Director').split(',').map(t=>t.trim());try{dbLog('🔍','Apollo search','Searching...');const res=await axios.post('https://api.apollo.io/v1/mixed_people/search',{page:1,per_page:parseInt(process.env.MAX_LEADS_PER_RUN)||20,person_titles:titles,organization_locations:[process.env.APOLLO_COUNTRY||'United States'],organization_num_employees_ranges:[`${process.env.APOLLO_MIN_EMPLOYEES||10},${process.env.APOLLO_MAX_EMPLOYEES||500}`],contact_email_status:['verified','likely to engage']},{headers:{'Content-Type':'application/json','X-Api-Key':process.env.APOLLO_API_KEY}});const people=res.data.people||[];const byCompany={};for(const p of people){const co=p.organization?.name;if(!co)continue;if(!byCompany[co])byCompany[co]={org:p.organization,people:[]};byCompany[co].people.push(p);}const maxC=parseInt(process.env.CONTACTS_PER_COMPANY)||2;let la=0,ca=0;for(const[coName,{org,people}]of Object.entries(byCompany)){const r=insertLead({company:coName,website:org?.website_url||null,industry:org?.industry||null,size:org?.num_employees?`${org.num_employees} employees`:null,location:org?.city?`${org.city}, ${org.country||''}`:null,source:'apollo',notes:'Apollo.io import'});la++;for(const p of people.slice(0,maxC)){const np=(p.name||'').split(' ');insertContact({lead_id:r.lastInsertRowid,name:p.name||'Unknown',first_name:np[0]||'there',role:p.title||'',email:p.email||null,linkedin:p.linkedin_url||null});ca++;}}dbLog('🚀','Apollo done',`${la} companies, ${ca} contacts`);return{leadsAdded:la,contactsAdded:ca};}catch(e){dbLog('❌','Apollo failed',e.response?.data?.error||e.message);throw e;}}
+
+// ── Hunter.io email finder ─────────────────────────────────────────────────
+async function findEmailHunter(firstName, lastName, domain){
+  const key = process.env.HUNTER_API_KEY;
+  if(!key) return null;
+  try {
+    const r = await axios.get('https://api.hunter.io/v2/email-finder', {
+      params: { first_name:firstName, last_name:lastName, domain, api_key:key },
+      timeout: 10000
+    });
+    return r.data?.data?.email || null;
+  } catch(e) { return null; }
+}
+async function findEmailsByDomain(domain){
+  const key = process.env.HUNTER_API_KEY;
+  if(!key) return [];
+  try {
+    const r = await axios.get('https://api.hunter.io/v2/domain-search', {
+      params: { domain, api_key:key, limit:5 },
+      timeout: 10000
+    });
+    return r.data?.data?.emails || [];
+  } catch(e) { return []; }
+}
+async function enrichContactsWithHunter(){
+  const contacts = db.get('contacts').filter(c=>!c.email).value();
+  let found = 0;
+  for(const c of contacts){
+    const lead = getLeadById(c.lead_id);
+    if(!lead?.website) continue;
+    const domain = lead.website.replace(/^https?:\/\//,'').replace(/\/.*/,'');
+    const nameParts = c.name.split(' ');
+    const email = await findEmailHunter(nameParts[0], nameParts[1]||'', domain);
+    if(email){ updateContactEmail(c.id, email); found++; dbLog('🔍','Email found via Hunter',`${c.name} → ${email}`); }
+    await new Promise(r=>setTimeout(r,1000));
+  }
+  return found;
+}
+
+// ── CSV Import (from Apollo export) ───────────────────────────────────────
+const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 10*1024*1024 } });
+
+function parseApolloCSV(buffer){
+  return new Promise((resolve, reject) => {
+    const results = [];
+    const stream = require('stream');
+    const readable = new stream.Readable();
+    readable.push(buffer);
+    readable.push(null);
+    readable.pipe(csvParser())
+      .on('data', row => results.push(row))
+      .on('end', () => resolve(results))
+      .on('error', reject);
+  });
+}
+
+async function importFromCSV(buffer){
+  const rows = await parseApolloCSV(buffer);
+  let leadsAdded=0, contactsAdded=0, skipped=0;
+
+  // Group by company
+  const byCompany = {};
+  for(const row of rows){
+    // Apollo CSV columns (handles both Apollo and generic CSVs)
+    const company = row['Company']||row['company']||row['Organization Name']||row['organization_name']||'';
+    const name = row['Name']||row['name']||row['Full Name']||`${row['First Name']||''} ${row['Last Name']||''}`.trim()||'Unknown';
+    const email = row['Email']||row['email']||row['Work Email']||'';
+    const role = row['Title']||row['title']||row['Job Title']||row['Role']||'';
+    const linkedin = row['LinkedIn Url']||row['linkedin_url']||row['LinkedIn']||'';
+    const website = row['Website']||row['website']||row['Company Website']||'';
+    const industry = row['Industry']||row['industry']||'';
+    const employees = row['# Employees']||row['employees']||row['Company Size']||'';
+    const location = row['City']||row['city']||'';
+
+    if(!company){ skipped++; continue; }
+    if(!byCompany[company]) byCompany[company]={ website, industry, employees, location, people:[] };
+    byCompany[company].people.push({ name, email, role, linkedin });
+  }
+
+  const maxContacts = parseInt(process.env.CONTACTS_PER_COMPANY)||2;
+
+  for(const [coName, {website,industry,employees,location,people}] of Object.entries(byCompany)){
+    // Skip if company already exists
+    const exists = db.get('leads').find(l=>l.company.toLowerCase()===coName.toLowerCase()).value();
+    if(exists){
+      // Just add new contacts if not already there
+      for(const p of people.slice(0,maxContacts)){
+        const contactExists = db.get('contacts').find(c=>c.lead_id===exists.id&&c.name===p.name).value();
+        if(!contactExists){ insertContact({lead_id:exists.id,name:p.name,first_name:p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null}); contactsAdded++; }
+      }
+      continue;
+    }
+    const r = insertLead({company:coName,website,industry,size:employees?`${employees} employees`:null,location,source:'csv',notes:'Imported from CSV'});
+    leadsAdded++;
+    for(const p of people.slice(0,maxContacts)){
+      insertContact({lead_id:r.lastInsertRowid,name:p.name,first_name:p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null});
+      contactsAdded++;
+    }
+  }
+
+  dbLog('📋','CSV import complete',`${leadsAdded} companies, ${contactsAdded} contacts, ${skipped} skipped`);
+  return{leadsAdded,contactsAdded,skipped,total:rows.length};
+}
+
+// ── Reply watcher ─────────────────────────────────────────────────────────
 async function checkForReplies(){return new Promise(resolve=>{const imap=new Imap({user:process.env.SMTP_USER,password:process.env.SMTP_PASS,host:process.env.IMAP_HOST||'imap.hostinger.com',port:993,tls:true,tlsOptions:{rejectUnauthorized:false},connTimeout:15000,authTimeout:15000});let found=0;imap.once('ready',()=>{imap.openBox('INBOX',false,(err)=>{if(err){imap.end();return resolve(0);}const since=new Date();since.setDate(since.getDate()-30);imap.search(['UNSEEN',['SINCE',since.toLocaleDateString('en-US',{month:'short',day:'2-digit',year:'numeric'})]],async(err,uids)=>{if(err||!uids?.length){imap.end();return resolve(0);}const fetch=imap.fetch(uids,{bodies:'',markSeen:false});const promises=[];fetch.on('message',msg=>{const p=new Promise(res=>{let buf='';msg.on('body',s=>s.on('data',d=>buf+=d.toString()));msg.once('end',async()=>{try{const parsed=await simpleParser(buf);const fe=parsed.from?.value?.[0]?.address?.toLowerCase();if(!fe)return res();const contact=db.get('contacts').filter(c=>c.email&&c.email.toLowerCase()===fe).value()[0];if(contact&&contact.status!=='replied'){found++;markContactReplied(contact.id);const lead=getLeadById(contact.lead_id);insertEmail({contact_id:contact.id,lead_id:contact.lead_id,direction:'in',subject:parsed.subject||'',body:parsed.text||'',from_addr:fe,to_addr:process.env.SMTP_USER,template_num:null,message_id:parsed.messageId||null});dbLog('💬','REPLY!',`${lead?.company}—${contact.name}`);await sendNotif({contactName:contact.name,companyName:lead?.company||'',replyBody:(parsed.text||'').substring(0,500)});}}catch(e){}res();});});promises.push(p);});fetch.once('end',async()=>{await Promise.all(promises);imap.end();resolve(found);});});});});imap.once('error',()=>resolve(0));imap.once('end',()=>{});imap.connect();});}
+
+// ── Agent ─────────────────────────────────────────────────────────────────
 let agentRunning=false;
-async function runAgentCycle({dryRun=false}={}){if(agentRunning)return;agentRunning=true;dbLog('⚡','Agent started',dryRun?'DRY RUN':'LIVE');try{const r=await checkForReplies();if(r>0)dbLog('🎉',`${r} replies`,'');try{await importLeadsFromApollo();}catch(e){}const nc=getContactsNotYetEmailed();let sent=0;const max=parseInt(process.env.MAX_EMAILS_PER_DAY)||30;for(const c of nc){if(sent>=max)break;const l=getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:1,dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}const fc=getContactsDueForFollowup();for(const c of fc){if(sent>=max)break;const l=getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:Math.min(c.emails_sent+1,4),dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}dbLog('✅','Cycle done',`${sent} emails`);}catch(e){dbLog('❌','Agent error',e.message);}finally{agentRunning=false;}}
-function startScheduler(){cron.schedule('0 9 * * 1-5',()=>runAgentCycle());cron.schedule('0 14 * * 1-5',()=>runAgentCycle());cron.schedule('*/15 * * * *',()=>checkForReplies());dbLog('📅','Scheduler active','9am+2pm weekdays, reply check every 15min');}
+async function runAgentCycle({dryRun=false}={}){if(agentRunning)return;agentRunning=true;dbLog('⚡','Agent started',dryRun?'DRY RUN':'LIVE');try{const r=await checkForReplies();if(r>0)dbLog('🎉',`${r} replies`,'');// Try Hunter.io email enrichment
+try{const hunterFound=await enrichContactsWithHunter();if(hunterFound>0)dbLog('🔍','Hunter enrichment',`${hunterFound} emails found`);}catch(e){}
+const nc=getContactsNotYetEmailed();let sent=0;const max=parseInt(process.env.MAX_EMAILS_PER_DAY)||30;for(const c of nc){if(sent>=max)break;const l=getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:1,dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}const fc=getContactsDueForFollowup();for(const c of fc){if(sent>=max)break;const l=getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:Math.min(c.emails_sent+1,4),dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}dbLog('✅','Cycle done',`${sent} emails`);}catch(e){dbLog('❌','Agent error',e.message);}finally{agentRunning=false;}}
+function startScheduler(){cron.schedule('0 9 * * 1-5',()=>runAgentCycle());cron.schedule('0 14 * * 1-5',()=>runAgentCycle());cron.schedule('*/15 * * * *',()=>checkForReplies());dbLog('📅','Scheduler active','9am+2pm weekdays, replies every 15min');}
+
+// ── Express ───────────────────────────────────────────────────────────────
 const app=express();
-app.use(cors());app.use(express.json());
+app.use(cors());
+app.use(express.json());
+
 app.get('/healthz',(req,res)=>res.status(200).send('OK'));
 app.get('/api/stats',(req,res)=>res.json(getStats()));
 app.get('/api/leads',(req,res)=>res.json(getAllLeads()));
@@ -48,7 +251,79 @@ app.get('/api/activity',(req,res)=>res.json(getRecentActivity(parseInt(req.query
 app.post('/api/agent/run',async(req,res)=>{const d=req.body?.dry_run===true;runAgentCycle({dryRun:d}).catch(console.error);res.json({ok:true,message:d?'Dry run started':'Agent started'});});
 app.post('/api/agent/check-replies',async(req,res)=>res.json({ok:true,replies_found:await checkForReplies()}));
 app.get('/api/test/gmail',async(req,res)=>res.json(await testSmtp()));
-app.get('/api/test/apollo',async(req,res)=>{try{await axios.post('https://api.apollo.io/v1/mixed_people/search',{per_page:1},{headers:{'Content-Type':'application/json','X-Api-Key':process.env.APOLLO_API_KEY},timeout:10000});res.json({ok:true,message:'Apollo connected'});}catch(e){res.json({ok:false,error:e.response?.data?.error||e.message});}});
-app.post('/api/apollo/import',async(req,res)=>{try{res.json({ok:true,...await importLeadsFromApollo()});}catch(e){res.json({ok:false,error:e.message});}});
+
+// Hunter.io test
+app.get('/api/test/hunter',async(req,res)=>{
+  const key=process.env.HUNTER_API_KEY;
+  if(!key) return res.json({ok:false,error:'HUNTER_API_KEY not set'});
+  try{
+    const r=await axios.get('https://api.hunter.io/v2/account',{params:{api_key:key},timeout:10000});
+    res.json({ok:true,plan:r.data?.data?.plan_name,searches_left:r.data?.data?.requests?.searches?.available});
+  }catch(e){res.json({ok:false,error:e.response?.data?.errors?.[0]?.details||e.message});}
+});
+
+// CSV upload endpoint
+app.post('/api/import/csv', upload.single('file'), async(req,res)=>{
+  if(!req.file) return res.status(400).json({error:'No file uploaded'});
+  try{
+    const result = await importFromCSV(req.file.buffer);
+    res.json({ok:true,...result});
+  }catch(e){
+    res.json({ok:false,error:e.message});
+  }
+});
+
+// Hunter enrichment endpoint
+app.post('/api/hunter/enrich',async(req,res)=>{
+  try{const found=await enrichContactsWithHunter();res.json({ok:true,emails_found:found});}
+  catch(e){res.json({ok:false,error:e.message});}
+});
+
+// ── Gmail OAuth routes ───────────────────────────────────────────────────
+app.get('/auth/start',(req,res)=>{
+  const client = getOAuth2Client();
+  const url = client.generateAuthUrl({
+    access_type:'offline',
+    prompt:'consent',
+    scope:['https://www.googleapis.com/auth/gmail.send','https://www.googleapis.com/auth/gmail.readonly','https://www.googleapis.com/auth/userinfo.email']
+  });
+  res.redirect(url);
+});
+
+app.get('/auth/callback',async(req,res)=>{
+  const {code} = req.query;
+  if(!code) return res.send('Error: no code received');
+  try {
+    const client = getOAuth2Client();
+    const {tokens} = await client.getToken(code);
+    const refreshToken = tokens.refresh_token;
+    if(!refreshToken) return res.send(`
+      <h2>⚠ No refresh token received</h2>
+      <p>This happens if you already authorised this app before.</p>
+      <p><a href="https://myaccount.google.com/permissions">Click here to revoke access</a>, then <a href="/auth/start">try again</a>.</p>
+    `);
+    res.send(`
+      <html><body style="font-family:monospace;padding:40px;background:#0a0c10;color:#e2e8f0;">
+      <h2 style="color:#00d4aa;">✅ Gmail Connected!</h2>
+      <p>Copy this refresh token and add it to Railway Variables as <strong>GMAIL_REFRESH_TOKEN</strong></p>
+      <textarea style="width:100%;height:80px;background:#111827;color:#00d4aa;border:1px solid #1e2d42;padding:10px;font-family:monospace;font-size:12px;">${refreshToken}</textarea>
+      <br><br>
+      <p>In Railway → Variables → add:</p>
+      <code style="background:#111827;padding:10px;display:block;margin:10px 0;">GMAIL_REFRESH_TOKEN = ${refreshToken}</code>
+      <p style="color:#94a3b8;">After adding the variable, Railway will restart and your agent will be able to send emails.</p>
+      </body></html>
+    `);
+  } catch(e){
+    res.send(`Error: ${e.message}`);
+  }
+});
+
 const PORT=process.env.PORT||3000;
-app.listen(PORT,'0.0.0.0',()=>{console.log(`\n🚀 LeadForge running on port ${PORT}\n`);startScheduler();dbLog('🟢','Server started',`Port ${PORT}`);});
+app.listen(PORT,'0.0.0.0',()=>{
+  console.log(`\n🚀 LeadForge running on port ${PORT}`);
+  console.log(`📋 CSV upload: POST /api/import/csv`);
+  console.log(`🎯 Hunter enrich: POST /api/hunter/enrich`);
+  console.log(`✅ Test: /healthz /api/stats /api/test/gmail /api/test/hunter\n`);
+  startScheduler();
+  dbLog('🟢','Server started',`Port ${PORT}`);
+});
