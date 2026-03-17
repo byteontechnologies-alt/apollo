@@ -373,7 +373,12 @@ async function scrapeRemoteOK(){
           website: job.url||null,
           source: 'remoteok',
           location: 'Remote / USA',
-          notes: `RemoteOK: hiring ${job.position||'developer'}`
+          job_title: job.position||'Developer',
+          job_url: `https://remoteok.com/l/${job.slug||''}`,
+          job_desc: job.description?job.description.replace(/<[^>]+>/g,'').substring(0,300):'',
+          salary: job.salary||'',
+          date_posted: job.date||'',
+          notes:`RemoteOK: hiring ${job.position||'developer'}${job.salary?' · '+job.salary:''}`
         });
       }
     }
@@ -398,11 +403,15 @@ async function scrapeGreenhouse(){
       const jobs = r.data?.jobs||[];
       const relevant = jobs.filter(j=>keywords.some(k=>(j.title||'').toLowerCase().includes(k)));
       if(relevant.length>0){
+        const jobTitles = relevant.slice(0,3).map(j=>j.title).join(', ');
         results.push({
           company: co.charAt(0).toUpperCase()+co.slice(1),
           website: `${co}.com`,
           source: 'greenhouse',
-          notes: `Greenhouse: ${relevant.length} open dev roles`
+          job_title: relevant[0]?.title||'Developer',
+          job_url: relevant[0]?.absolute_url||`https://boards.greenhouse.io/${co}`,
+          job_desc: `Open roles: ${jobTitles}`,
+          notes:`Greenhouse: ${relevant.length} open dev role${relevant.length!==1?'s':''} — ${jobTitles}`
         });
       }
     }catch(e){}
@@ -474,11 +483,21 @@ async function scrapeAllJobBoards(){
 
   let added = 0;
   for(const co of unique){
+    // Build structured notes with job post details
+    const jobDetails = [
+      co.notes||'',
+      co.job_title ? `Job Title: ${co.job_title}` : '',
+      co.job_url   ? `Job Post: ${co.job_url}` : '',
+      co.job_desc  ? `Description: ${co.job_desc.substring(0,300)}` : '',
+      co.salary    ? `Salary: ${co.salary}` : '',
+      co.date_posted ? `Posted: ${co.date_posted}` : '',
+    ].filter(Boolean).join('\n');
+
     const r = insertLead({
       company:co.company, website:co.website||null,
       industry:'Technology', size:null,
       location:co.location||'USA', source:co.source,
-      notes:co.notes||`Actively hiring developers — found via ${co.source}`,
+      notes:jobDetails,
     });
     insertContact({
       lead_id:r.lastInsertRowid, name:'Unknown',
@@ -558,6 +577,92 @@ app.post('/api/scrape/yc',async(req,res)=>{try{const r=await scrapeYC();res.json
 app.post('/api/hunter/enrich',async(req,res)=>{
   try{const found=await enrichContactsWithHunter();res.json({ok:true,emails_found:found});}
   catch(e){res.json({ok:false,error:e.message});}
+});
+
+// ── Waalaxy Webhook ──────────────────────────────────────────────────────
+// When someone accepts your LinkedIn connection, Waalaxy fires this webhook
+// The agent instantly adds them as a lead and starts the email sequence
+app.post('/webhook/waalaxy', async(req,res)=>{
+  try{
+    const data = req.body;
+    dbLog('🔗','Waalaxy webhook received', JSON.stringify(data).substring(0,100));
+
+    // Waalaxy sends prospect data in various formats — handle all of them
+    const prospects = data.prospects || data.leads || (Array.isArray(data)?data:[data]);
+
+    let added = 0;
+    for(const p of prospects){
+      // Extract fields from Waalaxy prospect object
+      const firstName  = p.firstName||p.first_name||p.firstname||'';
+      const lastName   = p.lastName||p.last_name||p.lastname||'';
+      const name       = p.name||`${firstName} ${lastName}`.trim()||'Unknown';
+      const company    = p.company||p.companyName||p.organization||'';
+      const role       = p.occupation||p.title||p.position||p.jobTitle||'';
+      const email      = p.email||p.emailAddress||'';
+      const linkedin   = p.linkedinUrl||p.linkedin||p.profileUrl||'';
+      const website    = p.companyWebsite||p.website||'';
+      const location   = p.location||p.city||'';
+
+      if(!company && !name){ continue; }
+
+      // Find or create the lead (company)
+      const coName = company || `${name}'s Company`;
+      let lead = db.get('leads').find(l=>l.company.toLowerCase().trim()===coName.toLowerCase().trim()).value();
+
+      if(!lead){
+        const r = insertLead({
+          company:coName, website, industry:null,
+          size:null, location, source:'waalaxy',
+          notes:`LinkedIn connection accepted via Waalaxy`
+        });
+        lead = {id: r.lastInsertRowid, company: coName};
+        added++;
+      }
+
+      // Add contact if not already there
+      const exists = db.get('contacts').find(c=>c.lead_id===lead.id&&c.name===name).value();
+      if(!exists){
+        insertContact({
+          lead_id:lead.id, name, first_name:firstName||name.split(' ')[0]||'there',
+          role, email:email||null, linkedin
+        });
+      }
+
+      // If email provided by Waalaxy — start sequence immediately
+      if(email){
+        dbLog('📤','Waalaxy lead ready to email',`${name} at ${coName} — ${email}`);
+      } else {
+        dbLog('🔍','Waalaxy lead needs email',`${name} at ${coName} — will search via Hunter`);
+        // Try Hunter.io to find email
+        if(process.env.HUNTER_API_KEY && website){
+          const domain = website.replace(/^https?:\/\//,'').replace(/\/.*/,'');
+          const hunterEmail = await findEmailHunter(firstName, lastName, domain);
+          if(hunterEmail){
+            const contact = db.get('contacts').find(c=>c.lead_id===lead.id&&c.name===name).value();
+            if(contact) updateContactEmail(contact.id, hunterEmail);
+            dbLog('🎯','Email found via Hunter',`${name} → ${hunterEmail}`);
+          }
+        }
+      }
+    }
+
+    dbLog('✅','Waalaxy webhook processed',`${added} new companies added`);
+    res.json({ok:true, added, message:'Prospects received and queued for outreach'});
+
+  }catch(e){
+    dbLog('❌','Waalaxy webhook error',e.message);
+    res.json({ok:false, error:e.message});
+  }
+});
+
+// Waalaxy webhook test
+app.get('/webhook/waalaxy/test',(req,res)=>{
+  res.json({
+    ok:true,
+    message:'Waalaxy webhook is ready!',
+    webhook_url:`${req.protocol}://${req.get('host')}/webhook/waalaxy`,
+    instructions:'Copy the webhook_url above and paste it into Waalaxy → Settings → Webhooks'
+  });
 });
 
 // ── Gmail OAuth routes ───────────────────────────────────────────────────
