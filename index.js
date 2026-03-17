@@ -175,63 +175,360 @@ function parseApolloCSV(buffer){
   });
 }
 
+function detectAndNormalizeRow(row){
+  // ── Waalaxy export format ──
+  // Waalaxy columns: First name, Last name, Occupation, Company, LinkedIn profile URL
+  if('First name' in row || 'Firstname' in row || 'firstName' in row){
+    const firstName = row['First name']||row['Firstname']||row['firstName']||'';
+    const lastName  = row['Last name']||row['Lastname']||row['lastName']||'';
+    return {
+      name:     `${firstName} ${lastName}`.trim()||'Unknown',
+      firstName: firstName,
+      company:  row['Company']||row['company']||row['Organization']||'',
+      role:     row['Occupation']||row['occupation']||row['Job title']||row['Position']||'',
+      email:    row['Email']||row['email']||'',
+      linkedin: row['LinkedIn profile URL']||row['LinkedIn']||row['linkedin']||row['Profile URL']||'',
+      website:  row['Website']||row['Company website']||'',
+      location: row['Location']||row['City']||'',
+      industry: row['Industry']||'',
+      source:   'waalaxy',
+    };
+  }
+  // ── Apollo export format ──
+  const firstName = row['First Name']||row['first_name']||'';
+  const lastName  = row['Last Name']||row['last_name']||'';
+  const fullName  = row['Name']||row['name']||row['Full Name']||`${firstName} ${lastName}`.trim()||'Unknown';
+  return {
+    name:     fullName,
+    firstName: fullName.split(' ')[0]||'there',
+    company:  row['Company']||row['company']||row['Organization Name']||'',
+    role:     row['Title']||row['title']||row['Job Title']||'',
+    email:    row['Email']||row['email']||row['Work Email']||'',
+    linkedin: row['LinkedIn Url']||row['linkedin_url']||row['LinkedIn']||'',
+    website:  row['Website']||row['Company Website']||'',
+    location: row['City']||row['city']||row['Location']||'',
+    industry: row['Industry']||row['industry']||'',
+    source:   'apollo',
+  };
+}
+
 async function importFromCSV(buffer){
   const rows = await parseApolloCSV(buffer);
+  if(!rows.length) return {leadsAdded:0,contactsAdded:0,skipped:0,total:0};
+
   let leadsAdded=0, contactsAdded=0, skipped=0;
-
-  // Group by company
   const byCompany = {};
-  for(const row of rows){
-    // Apollo CSV columns (handles both Apollo and generic CSVs)
-    const company = row['Company']||row['company']||row['Organization Name']||row['organization_name']||'';
-    const name = row['Name']||row['name']||row['Full Name']||`${row['First Name']||''} ${row['Last Name']||''}`.trim()||'Unknown';
-    const email = row['Email']||row['email']||row['Work Email']||'';
-    const role = row['Title']||row['title']||row['Job Title']||row['Role']||'';
-    const linkedin = row['LinkedIn Url']||row['linkedin_url']||row['LinkedIn']||'';
-    const website = row['Website']||row['website']||row['Company Website']||'';
-    const industry = row['Industry']||row['industry']||'';
-    const employees = row['# Employees']||row['employees']||row['Company Size']||'';
-    const location = row['City']||row['city']||'';
 
-    if(!company){ skipped++; continue; }
-    if(!byCompany[company]) byCompany[company]={ website, industry, employees, location, people:[] };
-    byCompany[company].people.push({ name, email, role, linkedin });
+  for(const row of rows){
+    const p = detectAndNormalizeRow(row);
+    if(!p.company){ skipped++; continue; }
+    const coKey = p.company.toLowerCase().trim();
+    if(!byCompany[coKey]) byCompany[coKey]={ company:p.company, website:p.website, industry:p.industry, location:p.location, source:p.source, people:[] };
+    byCompany[coKey].people.push(p);
   }
 
   const maxContacts = parseInt(process.env.CONTACTS_PER_COMPANY)||2;
 
-  for(const [coName, {website,industry,employees,location,people}] of Object.entries(byCompany)){
-    // Skip if company already exists
-    const exists = db.get('leads').find(l=>l.company.toLowerCase()===coName.toLowerCase()).value();
+  for(const [coKey, {company,website,industry,location,source,people}] of Object.entries(byCompany)){
+    // Skip duplicate companies — just add new contacts
+    const exists = db.get('leads').find(l=>l.company.toLowerCase().trim()===coKey).value();
     if(exists){
-      // Just add new contacts if not already there
       for(const p of people.slice(0,maxContacts)){
-        const contactExists = db.get('contacts').find(c=>c.lead_id===exists.id&&c.name===p.name).value();
-        if(!contactExists){ insertContact({lead_id:exists.id,name:p.name,first_name:p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null}); contactsAdded++; }
+        const dup = db.get('contacts').find(c=>c.lead_id===exists.id&&c.name===p.name).value();
+        if(!dup){ insertContact({lead_id:exists.id,name:p.name,first_name:p.firstName||p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null}); contactsAdded++; }
       }
       continue;
     }
-    const r = insertLead({company:coName,website,industry,size:employees?`${employees} employees`:null,location,source:'csv',notes:'Imported from CSV'});
+    const r = insertLead({company,website,industry,size:null,location,source,notes:`Imported from ${source==='waalaxy'?'Waalaxy':'Apollo.io'} CSV`});
     leadsAdded++;
     for(const p of people.slice(0,maxContacts)){
-      insertContact({lead_id:r.lastInsertRowid,name:p.name,first_name:p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null});
+      insertContact({lead_id:r.lastInsertRowid,name:p.name,first_name:p.firstName||p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null});
       contactsAdded++;
     }
   }
 
-  dbLog('📋','CSV import complete',`${leadsAdded} companies, ${contactsAdded} contacts, ${skipped} skipped`);
+  dbLog('📋',`CSV import complete (${rows[0]&&'First name' in rows[0]?'Waalaxy':'Apollo'} format)`,`${leadsAdded} companies, ${contactsAdded} contacts, ${skipped} skipped`);
   return{leadsAdded,contactsAdded,skipped,total:rows.length};
 }
 
 // ── Reply watcher ─────────────────────────────────────────────────────────
 async function checkForReplies(){return new Promise(resolve=>{const imap=new Imap({user:process.env.SMTP_USER,password:process.env.SMTP_PASS,host:process.env.IMAP_HOST||'imap.hostinger.com',port:993,tls:true,tlsOptions:{rejectUnauthorized:false},connTimeout:15000,authTimeout:15000});let found=0;imap.once('ready',()=>{imap.openBox('INBOX',false,(err)=>{if(err){imap.end();return resolve(0);}const since=new Date();since.setDate(since.getDate()-30);imap.search(['UNSEEN',['SINCE',since.toLocaleDateString('en-US',{month:'short',day:'2-digit',year:'numeric'})]],async(err,uids)=>{if(err||!uids?.length){imap.end();return resolve(0);}const fetch=imap.fetch(uids,{bodies:'',markSeen:false});const promises=[];fetch.on('message',msg=>{const p=new Promise(res=>{let buf='';msg.on('body',s=>s.on('data',d=>buf+=d.toString()));msg.once('end',async()=>{try{const parsed=await simpleParser(buf);const fe=parsed.from?.value?.[0]?.address?.toLowerCase();if(!fe)return res();const contact=db.get('contacts').filter(c=>c.email&&c.email.toLowerCase()===fe).value()[0];if(contact&&contact.status!=='replied'){found++;markContactReplied(contact.id);const lead=getLeadById(contact.lead_id);insertEmail({contact_id:contact.id,lead_id:contact.lead_id,direction:'in',subject:parsed.subject||'',body:parsed.text||'',from_addr:fe,to_addr:process.env.SMTP_USER,template_num:null,message_id:parsed.messageId||null});dbLog('💬','REPLY!',`${lead?.company}—${contact.name}`);await sendNotif({contactName:contact.name,companyName:lead?.company||'',replyBody:(parsed.text||'').substring(0,500)});}}catch(e){}res();});});promises.push(p);});fetch.once('end',async()=>{await Promise.all(promises);imap.end();resolve(found);});});});});imap.once('error',()=>resolve(0));imap.once('end',()=>{});imap.connect();});}
 
+// ── Job Board Scrapers ────────────────────────────────────────────────────
+
+// Helper: extract domain from URL
+function extractDomain(url=''){
+  try{ return new URL(url.startsWith('http')?url:'https://'+url).hostname.replace('www.',''); }
+  catch(e){ return url.replace(/^https?:\/\//,'').split('/')[0].replace('www.',''); }
+}
+
+// Helper: extract company website from job posting text
+function guessWebsite(company){
+  if(!company) return null;
+  return company.toLowerCase().replace(/[^a-z0-9]/g,'')+'com';
+}
+
+// Helper: deduplicate leads by company name
+function leadExists(company){
+  return !!db.get('leads').find(l=>l.company.toLowerCase().trim()===company.toLowerCase().trim()).value();
+}
+
+// ── 1. Indeed RSS Feed ───────────────────────────────────────────────────
+async function scrapeIndeed(keywords=['React developer','Node.js developer','Python developer','DevOps engineer','Full stack developer']){
+  const results = [];
+  for(const kw of keywords){
+    try{
+      const encoded = encodeURIComponent(kw);
+      const url = `https://www.indeed.com/rss?q=${encoded}&l=United+States&sort=date`;
+      const r = await axios.get(url, {
+        headers:{'User-Agent':'Mozilla/5.0 (compatible; RSS reader)'},
+        timeout:15000
+      });
+      // Parse RSS XML manually
+      const items = r.data.match(/<item>([\s\S]*?)<\/item>/g)||[];
+      for(const item of items.slice(0,10)){
+        const title   = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)||[])[1]||'';
+        const company = (item.match(/<source[^>]*>(.*?)<\/source>/)||[])[1]||
+                        (item.match(/<![CDATA[^>]*company[^>]*>(.*?)<\/]/)||[])[1]||'';
+        const link    = (item.match(/<link>(.*?)<\/link>/)||[])[1]||'';
+        const desc    = (item.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>/)||[])[1]||'';
+        // Extract company from description
+        const coMatch = desc.match(/company[:\s]+([A-Za-z0-9\s&]+?)[\.<]/i)||
+                        desc.match(/<b>([A-Za-z0-9\s&]+?)<\/b>/)||[];
+        const coName  = company||coMatch[1]||'';
+        if(coName && coName.length>2) results.push({company:coName.trim(), source:'indeed', keyword:kw, link, notes:`Indeed job ad: ${title}`});
+      }
+    }catch(e){ dbLog('⚠️','Indeed scrape error',e.message); }
+    await new Promise(r=>setTimeout(r,2000));
+  }
+  return results;
+}
+
+// ── 2. Google Search Scraper ─────────────────────────────────────────────
+async function scrapeGoogle(queries=[
+  'site:lever.co "React developer" "United States"',
+  'site:greenhouse.io "Node.js" "United States"',
+  'site:workable.com "Python developer" "USA"',
+  'site:jobs.ashbyhq.com "Full stack developer"',
+  '"we are hiring" "React developer" site:linkedin.com/jobs',
+  'startup "hiring React developer" USA 2025',
+  '"looking for" "Node.js developer" company USA',
+]){
+  const results = [];
+  for(const q of queries){
+    try{
+      const encoded = encodeURIComponent(q);
+      const url = `https://www.google.com/search?q=${encoded}&num=10&hl=en`;
+      const r = await axios.get(url, {
+        headers:{
+          'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept':'text/html',
+          'Accept-Language':'en-US,en;q=0.9',
+        },
+        timeout:15000
+      });
+      // Extract result titles and URLs
+      const titleMatches = r.data.match(/<h3[^>]*>(.*?)<\/h3>/g)||[];
+      const urlMatches   = r.data.match(/https?:\/\/(?:lever\.co|greenhouse\.io|workable\.com|ashbyhq\.com|jobs\.lever\.co)[^"&\s]*/g)||[];
+      
+      for(const urlMatch of urlMatches.slice(0,8)){
+        // Extract company from ATS URLs
+        // lever.co/companyname/... greenhouse.io/companyname/...
+        const parts = urlMatch.replace(/https?:\/\//,'').split('/');
+        const domain = parts[0];
+        const company = parts[1]||'';
+        if(company && company.length>2 && !company.includes('?')){
+          const coName = company.replace(/-/g,' ').replace(/\w/g,c=>c.toUpperCase());
+          results.push({
+            company: coName,
+            website: `${company}.com`,
+            source: 'google',
+            keyword: q,
+            link: urlMatch,
+            notes: `Google search: found on ${domain}`
+          });
+        }
+      }
+
+      // Also extract plain company names from titles
+      for(const t of titleMatches.slice(0,5)){
+        const text = t.replace(/<[^>]+>/g,'');
+        const atMatch = text.match(/at ([A-Z][A-Za-z0-9\s&]+?)(?:\s*[-|·]|\s*$)/);
+        if(atMatch && atMatch[1].length>2 && atMatch[1].length<50){
+          results.push({company:atMatch[1].trim(), source:'google', keyword:q, notes:`Google: ${text.substring(0,80)}`});
+        }
+      }
+    }catch(e){ dbLog('⚠️','Google scrape error',e.message); }
+    await new Promise(r=>setTimeout(r,3000)); // be polite to Google
+  }
+  return results;
+}
+
+// ── 3. YCombinator Jobs ──────────────────────────────────────────────────
+async function scrapeYC(){
+  const results = [];
+  try{
+    const r = await axios.get('https://news.ycombinator.com/jobs', {
+      headers:{'User-Agent':'Mozilla/5.0'},
+      timeout:15000
+    });
+    const items = r.data.match(/class="storylink"[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>/g)||[];
+    for(const item of items.slice(0,20)){
+      const urlM = item.match(/href="([^"]+)"/);
+      const nameM = item.match(/>([^<]+)<\/a>/);
+      if(nameM){
+        // Extract company name — usually "Company (YC S24) is hiring..."
+        const text = nameM[1];
+        const coMatch = text.match(/^([^(]+)/);
+        const coName = coMatch?coMatch[1].trim():'';
+        if(coName && coName.length>2){
+          results.push({company:coName, source:'ycombinator', link:urlM?urlM[1]:'', notes:`YC Jobs: ${text.substring(0,100)}`});
+        }
+      }
+    }
+    dbLog('🚀','YC Jobs scraped',`${results.length} companies found`);
+  }catch(e){ dbLog('⚠️','YC scrape error',e.message); }
+  return results;
+}
+
+// ── 4. Wellfound (AngelList) ─────────────────────────────────────────────
+async function scrapeWellfound(){
+  const results = [];
+  try{
+    // Wellfound has a public JSON API for job listings
+    const roles = ['engineer','developer','engineering'];
+    for(const role of roles){
+      const r = await axios.get(`https://wellfound.com/role/l/${role}`, {
+        headers:{
+          'User-Agent':'Mozilla/5.0',
+          'Accept':'text/html',
+        },
+        timeout:15000
+      });
+      // Extract company names from the page
+      const coMatches = r.data.match(/"name":"([^"]{3,50})","type":"Organization"/g)||[];
+      for(const m of coMatches.slice(0,15)){
+        const name = (m.match(/"name":"([^"]+)"/)||[])[1]||'';
+        if(name) results.push({company:name, source:'wellfound', notes:`Wellfound: hiring ${role}`});
+      }
+      await new Promise(r=>setTimeout(r,2000));
+    }
+    dbLog('🦗','Wellfound scraped',`${results.length} companies found`);
+  }catch(e){ dbLog('⚠️','Wellfound scrape error',e.message); }
+  return results;
+}
+
+// ── 5. LinkedIn Jobs via Google ──────────────────────────────────────────
+async function scrapeLinkedInJobs(){
+  const results = [];
+  const searches = [
+    'site:linkedin.com/jobs "React developer" "United States" "11-50 employees"',
+    'site:linkedin.com/jobs "Node.js developer" USA startup',
+    'site:linkedin.com/jobs "Python developer" "Series A" OR "Series B"',
+    'site:linkedin.com/jobs "Full stack" "remote" "United States"',
+  ];
+  try{
+    for(const q of searches){
+      const encoded = encodeURIComponent(q);
+      const r = await axios.get(`https://www.google.com/search?q=${encoded}&num=10`, {
+        headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+        timeout:15000
+      });
+      // Extract company names from LinkedIn job URLs and titles
+      const titles = r.data.match(/<h3[^>]*>(.*?)<\/h3>/g)||[];
+      for(const t of titles){
+        const text = t.replace(/<[^>]+>/g,'');
+        // LinkedIn titles format: "Job Title at Company | LinkedIn"
+        const atMatch = text.match(/ at ([A-Z][A-Za-z0-9\s&,\.]+?)(?:\s*\||\s*-)/);
+        if(atMatch && atMatch[1].length>2 && atMatch[1].length<60){
+          results.push({company:atMatch[1].trim(), source:'linkedin_jobs', notes:`LinkedIn Jobs: ${text.substring(0,80)}`});
+        }
+      }
+      await new Promise(r=>setTimeout(r,3000));
+    }
+    dbLog('🔵','LinkedIn Jobs scraped via Google',`${results.length} companies found`);
+  }catch(e){ dbLog('⚠️','LinkedIn Jobs scrape error',e.message); }
+  return results;
+}
+
+// ── Master scraper — runs all sources and imports results ────────────────
+async function scrapeAllJobBoards(){
+  dbLog('🌐','Job board scrape started','Indeed + Google + YC + Wellfound + LinkedIn Jobs');
+  
+  const [indeed, google, yc, wellfound, linkedin] = await Promise.allSettled([
+    scrapeIndeed(),
+    scrapeGoogle(),
+    scrapeYC(),
+    scrapeWellfound(),
+    scrapeLinkedInJobs(),
+  ]);
+
+  // Combine all results
+  const all = [
+    ...(indeed.value||[]),
+    ...(google.value||[]),
+    ...(yc.value||[]),
+    ...(wellfound.value||[]),
+    ...(linkedin.value||[]),
+  ];
+
+  // Deduplicate by company name
+  const seen = new Set();
+  const unique = all.filter(r=>{
+    const key = r.company.toLowerCase().trim();
+    if(seen.has(key)||leadExists(r.company)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  dbLog('📊','Scrape results',`${all.length} total → ${unique.length} new unique companies`);
+
+  // Import into database
+  let added = 0;
+  for(const co of unique){
+    if(!co.company || co.company.length < 2) continue;
+    const r = insertLead({
+      company: co.company,
+      website: co.website||null,
+      industry: 'Technology',
+      size: null,
+      location: co.location||'USA',
+      source: co.source,
+      notes: co.notes||`Found via ${co.source} — actively hiring developers`,
+    });
+    // Add a placeholder contact to find later
+    insertContact({
+      lead_id: r.lastInsertRowid,
+      name: 'Unknown',
+      first_name: 'there',
+      role: 'CTO / HR Manager',
+      email: null,
+      linkedin: null,
+    });
+    added++;
+  }
+
+  dbLog('✅','Job board import done',`${added} new companies added to pipeline`);
+  return { total: all.length, unique: unique.length, added };
+}
+
 // ── Agent ─────────────────────────────────────────────────────────────────
 let agentRunning=false;
-async function runAgentCycle({dryRun=false}={}){if(agentRunning)return;agentRunning=true;dbLog('⚡','Agent started',dryRun?'DRY RUN':'LIVE');try{const r=await checkForReplies();if(r>0)dbLog('🎉',`${r} replies`,'');// Try Hunter.io email enrichment
-try{const hunterFound=await enrichContactsWithHunter();if(hunterFound>0)dbLog('🔍','Hunter enrichment',`${hunterFound} emails found`);}catch(e){}
+async function runAgentCycle({dryRun=false}={}){if(agentRunning)return;agentRunning=true;dbLog('⚡','Agent started',dryRun?'DRY RUN':'LIVE');try{const r=await checkForReplies();if(r>0)dbLog('🎉',`${r} replies`,'');// Scrape job boards for new leads
+try{await scrapeAllJobBoards();}catch(e){dbLog('⚠️','Scraper error',e.message);}// Try Hunter.io email enrichment
+try{await scrapeAllJobBoards();}catch(e){dbLog('⚠️','Scraper error',e.message);}try{const hunterFound=await enrichContactsWithHunter();if(hunterFound>0)dbLog('🔍','Hunter enrichment',`${hunterFound} emails found`);}catch(e){}
 const nc=getContactsNotYetEmailed();let sent=0;const max=parseInt(process.env.MAX_EMAILS_PER_DAY)||30;for(const c of nc){if(sent>=max)break;const l=getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:1,dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}const fc=getContactsDueForFollowup();for(const c of fc){if(sent>=max)break;const l=getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:Math.min(c.emails_sent+1,4),dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}dbLog('✅','Cycle done',`${sent} emails`);}catch(e){dbLog('❌','Agent error',e.message);}finally{agentRunning=false;}}
-function startScheduler(){cron.schedule('0 9 * * 1-5',()=>runAgentCycle());cron.schedule('0 14 * * 1-5',()=>runAgentCycle());cron.schedule('*/15 * * * *',()=>checkForReplies());dbLog('📅','Scheduler active','9am+2pm weekdays, replies every 15min');}
+function startScheduler(){
+  // Full agent run: 9am weekdays (scrape + email)
+  cron.schedule('0 9 * * 1-5',()=>runAgentCycle());
+  // Afternoon follow-ups: 2pm weekdays
+  cron.schedule('0 14 * * 1-5',()=>runAgentCycle());
+  // Extra scrape: 6pm weekdays to catch new job posts
+  cron.schedule('0 18 * * 1-5',()=>scrapeAllJobBoards().catch(console.error));
+  // Reply check: every 15 minutes
+  cron.schedule('*/15 * * * *',()=>checkForReplies());
+  dbLog('📅','Scheduler active','Scrape+email: 9am & 6pm | Follow-ups: 2pm | Replies: every 15min');
+}
 
 // ── Express ───────────────────────────────────────────────────────────────
 const app=express();
@@ -274,6 +571,10 @@ app.post('/api/import/csv', upload.single('file'), async(req,res)=>{
 });
 
 // Hunter enrichment endpoint
+app.post('/api/scrape',async(req,res)=>{try{res.json({ok:true,...await scrapeAllJobBoards()});}catch(e){res.json({ok:false,error:e.message});}});
+app.post('/api/scrape/indeed',async(req,res)=>{try{const r=await scrapeIndeed();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
+app.post('/api/scrape/google',async(req,res)=>{try{const r=await scrapeGoogle();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
+app.post('/api/scrape/yc',async(req,res)=>{try{const r=await scrapeYC();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
 app.post('/api/hunter/enrich',async(req,res)=>{
   try{const found=await enrichContactsWithHunter();res.json({ok:true,emails_found:found});}
   catch(e){res.json({ok:false,error:e.message});}
