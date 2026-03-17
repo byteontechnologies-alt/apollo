@@ -254,262 +254,242 @@ async function importFromCSV(buffer){
 // ── Reply watcher ─────────────────────────────────────────────────────────
 async function checkForReplies(){return new Promise(resolve=>{const imap=new Imap({user:process.env.SMTP_USER,password:process.env.SMTP_PASS,host:process.env.IMAP_HOST||'imap.hostinger.com',port:993,tls:true,tlsOptions:{rejectUnauthorized:false},connTimeout:15000,authTimeout:15000});let found=0;imap.once('ready',()=>{imap.openBox('INBOX',false,(err)=>{if(err){imap.end();return resolve(0);}const since=new Date();since.setDate(since.getDate()-30);imap.search(['UNSEEN',['SINCE',since.toLocaleDateString('en-US',{month:'short',day:'2-digit',year:'numeric'})]],async(err,uids)=>{if(err||!uids?.length){imap.end();return resolve(0);}const fetch=imap.fetch(uids,{bodies:'',markSeen:false});const promises=[];fetch.on('message',msg=>{const p=new Promise(res=>{let buf='';msg.on('body',s=>s.on('data',d=>buf+=d.toString()));msg.once('end',async()=>{try{const parsed=await simpleParser(buf);const fe=parsed.from?.value?.[0]?.address?.toLowerCase();if(!fe)return res();const contact=db.get('contacts').filter(c=>c.email&&c.email.toLowerCase()===fe).value()[0];if(contact&&contact.status!=='replied'){found++;markContactReplied(contact.id);const lead=getLeadById(contact.lead_id);insertEmail({contact_id:contact.id,lead_id:contact.lead_id,direction:'in',subject:parsed.subject||'',body:parsed.text||'',from_addr:fe,to_addr:process.env.SMTP_USER,template_num:null,message_id:parsed.messageId||null});dbLog('💬','REPLY!',`${lead?.company}—${contact.name}`);await sendNotif({contactName:contact.name,companyName:lead?.company||'',replyBody:(parsed.text||'').substring(0,500)});}}catch(e){}res();});});promises.push(p);});fetch.once('end',async()=>{await Promise.all(promises);imap.end();resolve(found);});});});});imap.once('error',()=>resolve(0));imap.once('end',()=>{});imap.connect();});}
 
-// ── Job Board Scrapers ────────────────────────────────────────────────────
+// ── Job Board Scrapers (RSS + Public APIs — no bot blocking) ─────────────
 
-// Helper: extract domain from URL
 function extractDomain(url=''){
   try{ return new URL(url.startsWith('http')?url:'https://'+url).hostname.replace('www.',''); }
-  catch(e){ return url.replace(/^https?:\/\//,'').split('/')[0].replace('www.',''); }
+  catch(e){ return ''; }
 }
 
-// Helper: extract company website from job posting text
-function guessWebsite(company){
-  if(!company) return null;
-  return company.toLowerCase().replace(/[^a-z0-9]/g,'')+'com';
-}
-
-// Helper: deduplicate leads by company name
 function leadExists(company){
   return !!db.get('leads').find(l=>l.company.toLowerCase().trim()===company.toLowerCase().trim()).value();
 }
 
-// ── 1. Indeed RSS Feed ───────────────────────────────────────────────────
-async function scrapeIndeed(keywords=['React developer','Node.js developer','Python developer','DevOps engineer','Full stack developer']){
+// ── 1. Indeed RSS (most reliable — official feed) ────────────────────────
+async function scrapeIndeed(){
   const results = [];
+  const keywords = [
+    'React+developer','Node.js+developer','Python+developer',
+    'Full+stack+developer','DevOps+engineer','Software+engineer',
+    'Mobile+developer','Backend+developer'
+  ];
   for(const kw of keywords){
     try{
-      const encoded = encodeURIComponent(kw);
-      const url = `https://www.indeed.com/rss?q=${encoded}&l=United+States&sort=date`;
-      const r = await axios.get(url, {
-        headers:{'User-Agent':'Mozilla/5.0 (compatible; RSS reader)'},
-        timeout:15000
+      const url = `https://www.indeed.com/rss?q=${kw}&l=United+States&sort=date&fromage=7`;
+      const r = await axios.get(url,{
+        headers:{'User-Agent':'Mozilla/5.0 (compatible; RSS/2.0)','Accept':'application/rss+xml,text/xml'},
+        timeout:20000
       });
-      // Parse RSS XML manually
-      const items = r.data.match(/<item>([\s\S]*?)<\/item>/g)||[];
-      for(const item of items.slice(0,10)){
-        const title   = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)||[])[1]||'';
-        const company = (item.match(/<source[^>]*>(.*?)<\/source>/)||[])[1]||
-                        (item.match(/<![CDATA[^>]*company[^>]*>(.*?)<\/]/)||[])[1]||'';
-        const link    = (item.match(/<link>(.*?)<\/link>/)||[])[1]||'';
-        const desc    = (item.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>/)||[])[1]||'';
-        // Extract company from description
-        const coMatch = desc.match(/company[:\s]+([A-Za-z0-9\s&]+?)[\.<]/i)||
-                        desc.match(/<b>([A-Za-z0-9\s&]+?)<\/b>/)||[];
-        const coName  = company||coMatch[1]||'';
-        if(coName && coName.length>2) results.push({company:coName.trim(), source:'indeed', keyword:kw, link, notes:`Indeed job ad: ${title}`});
+      const xml = r.data;
+      // Parse items from RSS
+      const items = xml.split('<item>').slice(1);
+      for(const item of items.slice(0,8)){
+        const title   = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/s)||item.match(/<title>(.*?)<\/title>/s)||[])[1]||'';
+        const desc    = (item.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>/s)||[])[1]||'';
+        const link    = (item.match(/<link>(.*?)<\/link>/s)||[])[1]||'';
+        // Extract company from title: "Job Title - Company Name"
+        const dashIdx = title.lastIndexOf(' - ');
+        const company = dashIdx>0 ? title.substring(dashIdx+3).trim() : '';
+        if(company && company.length>1 && company.length<60 && !company.toLowerCase().includes('indeed')){
+          results.push({company, source:'indeed', link, notes:`Indeed: hiring ${kw.replace('+',' ')}`});
+        }
       }
-    }catch(e){ dbLog('⚠️','Indeed scrape error',e.message); }
-    await new Promise(r=>setTimeout(r,2000));
+    }catch(e){}
+    await new Promise(r=>setTimeout(r,1500));
   }
+  dbLog('💼','Indeed RSS',`${results.length} job posts found`);
   return results;
 }
 
-// ── 2. Google Search Scraper ─────────────────────────────────────────────
-async function scrapeGoogle(queries=[
-  'site:lever.co "React developer" "United States"',
-  'site:greenhouse.io "Node.js" "United States"',
-  'site:workable.com "Python developer" "USA"',
-  'site:jobs.ashbyhq.com "Full stack developer"',
-  '"we are hiring" "React developer" site:linkedin.com/jobs',
-  'startup "hiring React developer" USA 2025',
-  '"looking for" "Node.js developer" company USA',
-]){
+// ── 2. HackerNews "Who is Hiring" (monthly thread) ───────────────────────
+async function scrapeHNHiring(){
   const results = [];
-  for(const q of queries){
-    try{
-      const encoded = encodeURIComponent(q);
-      const url = `https://www.google.com/search?q=${encoded}&num=10&hl=en`;
-      const r = await axios.get(url, {
-        headers:{
-          'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept':'text/html',
-          'Accept-Language':'en-US,en;q=0.9',
-        },
-        timeout:15000
-      });
-      // Extract result titles and URLs
-      const titleMatches = r.data.match(/<h3[^>]*>(.*?)<\/h3>/g)||[];
-      const urlMatches   = r.data.match(/https?:\/\/(?:lever\.co|greenhouse\.io|workable\.com|ashbyhq\.com|jobs\.lever\.co)[^"&\s]*/g)||[];
-      
-      for(const urlMatch of urlMatches.slice(0,8)){
-        // Extract company from ATS URLs
-        // lever.co/companyname/... greenhouse.io/companyname/...
-        const parts = urlMatch.replace(/https?:\/\//,'').split('/');
-        const domain = parts[0];
-        const company = parts[1]||'';
-        if(company && company.length>2 && !company.includes('?')){
-          const coName = company.replace(/-/g,' ').replace(/\w/g,c=>c.toUpperCase());
-          results.push({
-            company: coName,
-            website: `${company}.com`,
-            source: 'google',
-            keyword: q,
-            link: urlMatch,
-            notes: `Google search: found on ${domain}`
-          });
-        }
-      }
+  try{
+    // Search HN for the latest "Who is Hiring" thread
+    const search = await axios.get('https://hn.algolia.com/api/v1/search?query=Ask+HN+Who+is+hiring&tags=story&restrictSearchableAttributes=title',{timeout:10000});
+    const hits = search.data?.hits||[];
+    const thread = hits.find(h=>h.title?.includes('Who is Hiring'));
+    if(!thread) return results;
 
-      // Also extract plain company names from titles
-      for(const t of titleMatches.slice(0,5)){
-        const text = t.replace(/<[^>]+>/g,'');
-        const atMatch = text.match(/at ([A-Z][A-Za-z0-9\s&]+?)(?:\s*[-|·]|\s*$)/);
-        if(atMatch && atMatch[1].length>2 && atMatch[1].length<50){
-          results.push({company:atMatch[1].trim(), source:'google', keyword:q, notes:`Google: ${text.substring(0,80)}`});
+    // Get the thread comments
+    const comments = await axios.get(`https://hn.algolia.com/api/v1/items/${thread.objectID}`,{timeout:15000});
+    const children = comments.data?.children||[];
+
+    for(const comment of children.slice(0,50)){
+      const text = comment?.text||'';
+      if(!text) continue;
+      // Extract company name — HN hiring posts start with "Company | Location | ..."
+      const pipeMatch = text.match(/^<p>([^|<]{2,50})\s*\|/);
+      const company = pipeMatch?pipeMatch[1].trim():'';
+      if(company && company.length>1){
+        // Check if it mentions outsourcing-relevant roles
+        const relevant = /react|node|python|javascript|typescript|devops|backend|frontend|fullstack|full.stack|engineer|developer/i.test(text);
+        if(relevant){
+          results.push({company, source:'hackernews', notes:'HN Who is Hiring — tech roles'});
         }
       }
-    }catch(e){ dbLog('⚠️','Google scrape error',e.message); }
-    await new Promise(r=>setTimeout(r,3000)); // be polite to Google
-  }
+    }
+    dbLog('🔶','HackerNews Hiring',`${results.length} companies found`);
+  }catch(e){ dbLog('⚠️','HN error',e.message); }
   return results;
 }
 
-// ── 3. YCombinator Jobs ──────────────────────────────────────────────────
+// ── 3. YCombinator Jobs (official page) ──────────────────────────────────
 async function scrapeYC(){
   const results = [];
   try{
-    const r = await axios.get('https://news.ycombinator.com/jobs', {
-      headers:{'User-Agent':'Mozilla/5.0'},
-      timeout:15000
+    // Use HN Algolia API to find YC job posts
+    const r = await axios.get('https://hn.algolia.com/api/v1/search?query=hiring&tags=job&hitsPerPage=50',{timeout:15000});
+    const hits = r.data?.hits||[];
+    for(const hit of hits){
+      const company = hit.author||'';
+      const text = hit.title||hit.story_text||'';
+      if(company && text){
+        const relevant = /react|node|python|developer|engineer|devops|frontend|backend/i.test(text);
+        if(relevant) results.push({company, source:'ycombinator', notes:`YC Jobs: ${text.substring(0,80)}`});
+      }
+    }
+    dbLog('🚀','YC Jobs',`${results.length} companies found`);
+  }catch(e){ dbLog('⚠️','YC error',e.message); }
+  return results;
+}
+
+// ── 4. RemoteOK API (free public API — no blocking) ──────────────────────
+async function scrapeRemoteOK(){
+  const results = [];
+  try{
+    const r = await axios.get('https://remoteok.com/api',{
+      headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'},
+      timeout:20000
     });
-    const items = r.data.match(/class="storylink"[^>]*href="([^"]+)"[^>]*>([^<]+)<\/a>/g)||[];
-    for(const item of items.slice(0,20)){
-      const urlM = item.match(/href="([^"]+)"/);
-      const nameM = item.match(/>([^<]+)<\/a>/);
-      if(nameM){
-        // Extract company name — usually "Company (YC S24) is hiring..."
-        const text = nameM[1];
-        const coMatch = text.match(/^([^(]+)/);
-        const coName = coMatch?coMatch[1].trim():'';
-        if(coName && coName.length>2){
-          results.push({company:coName, source:'ycombinator', link:urlM?urlM[1]:'', notes:`YC Jobs: ${text.substring(0,100)}`});
-        }
+    const jobs = Array.isArray(r.data)?r.data.filter(j=>j.company):[];
+    const keywords = ['react','node','python','javascript','typescript','devops','backend','fullstack'];
+    for(const job of jobs.slice(0,100)){
+      const text = `${job.position||''} ${job.tags?.join(' ')||''}`.toLowerCase();
+      const relevant = keywords.some(k=>text.includes(k));
+      if(relevant && job.company){
+        results.push({
+          company: job.company,
+          website: job.url||null,
+          source: 'remoteok',
+          location: 'Remote / USA',
+          notes: `RemoteOK: hiring ${job.position||'developer'}`
+        });
       }
     }
-    dbLog('🚀','YC Jobs scraped',`${results.length} companies found`);
-  }catch(e){ dbLog('⚠️','YC scrape error',e.message); }
+    dbLog('🌍','RemoteOK',`${results.length} companies found`);
+  }catch(e){ dbLog('⚠️','RemoteOK error',e.message); }
   return results;
 }
 
-// ── 4. Wellfound (AngelList) ─────────────────────────────────────────────
-async function scrapeWellfound(){
+// ── 5. Greenhouse Job Board API (public — no auth needed) ────────────────
+async function scrapeGreenhouse(){
   const results = [];
-  try{
-    // Wellfound has a public JSON API for job listings
-    const roles = ['engineer','developer','engineering'];
-    for(const role of roles){
-      const r = await axios.get(`https://wellfound.com/role/l/${role}`, {
-        headers:{
-          'User-Agent':'Mozilla/5.0',
-          'Accept':'text/html',
-        },
-        timeout:15000
-      });
-      // Extract company names from the page
-      const coMatches = r.data.match(/"name":"([^"]{3,50})","type":"Organization"/g)||[];
-      for(const m of coMatches.slice(0,15)){
-        const name = (m.match(/"name":"([^"]+)"/)||[])[1]||'';
-        if(name) results.push({company:name, source:'wellfound', notes:`Wellfound: hiring ${role}`});
-      }
-      await new Promise(r=>setTimeout(r,2000));
-    }
-    dbLog('🦗','Wellfound scraped',`${results.length} companies found`);
-  }catch(e){ dbLog('⚠️','Wellfound scrape error',e.message); }
-  return results;
-}
-
-// ── 5. LinkedIn Jobs via Google ──────────────────────────────────────────
-async function scrapeLinkedInJobs(){
-  const results = [];
-  const searches = [
-    'site:linkedin.com/jobs "React developer" "United States" "11-50 employees"',
-    'site:linkedin.com/jobs "Node.js developer" USA startup',
-    'site:linkedin.com/jobs "Python developer" "Series A" OR "Series B"',
-    'site:linkedin.com/jobs "Full stack" "remote" "United States"',
+  // These are real companies on Greenhouse — publicly accessible
+  const companies = [
+    'airbnb','stripe','twilio','shopify','hubspot','zendesk','intercom',
+    'squarespace','asana','figma','notion','linear','vercel','netlify',
+    'planetscale','supabase','clerk','resend','postmark','segment'
   ];
-  try{
-    for(const q of searches){
-      const encoded = encodeURIComponent(q);
-      const r = await axios.get(`https://www.google.com/search?q=${encoded}&num=10`, {
-        headers:{'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
-        timeout:15000
-      });
-      // Extract company names from LinkedIn job URLs and titles
-      const titles = r.data.match(/<h3[^>]*>(.*?)<\/h3>/g)||[];
-      for(const t of titles){
-        const text = t.replace(/<[^>]+>/g,'');
-        // LinkedIn titles format: "Job Title at Company | LinkedIn"
-        const atMatch = text.match(/ at ([A-Z][A-Za-z0-9\s&,\.]+?)(?:\s*\||\s*-)/);
-        if(atMatch && atMatch[1].length>2 && atMatch[1].length<60){
-          results.push({company:atMatch[1].trim(), source:'linkedin_jobs', notes:`LinkedIn Jobs: ${text.substring(0,80)}`});
-        }
+  const keywords = ['react','node','python','engineer','developer','devops','backend','frontend'];
+  for(const co of companies.slice(0,10)){
+    try{
+      const r = await axios.get(`https://boards-api.greenhouse.io/v1/boards/${co}/jobs`,{timeout:8000});
+      const jobs = r.data?.jobs||[];
+      const relevant = jobs.filter(j=>keywords.some(k=>(j.title||'').toLowerCase().includes(k)));
+      if(relevant.length>0){
+        results.push({
+          company: co.charAt(0).toUpperCase()+co.slice(1),
+          website: `${co}.com`,
+          source: 'greenhouse',
+          notes: `Greenhouse: ${relevant.length} open dev roles`
+        });
       }
-      await new Promise(r=>setTimeout(r,3000));
-    }
-    dbLog('🔵','LinkedIn Jobs scraped via Google',`${results.length} companies found`);
-  }catch(e){ dbLog('⚠️','LinkedIn Jobs scrape error',e.message); }
+    }catch(e){}
+    await new Promise(r=>setTimeout(r,500));
+  }
+  dbLog('🌱','Greenhouse',`${results.length} companies actively hiring`);
   return results;
 }
 
-// ── Master scraper — runs all sources and imports results ────────────────
+// ── 6. Google Custom Search API (optional — needs key) ───────────────────
+async function scrapeGoogleCustom(){
+  const key = process.env.GOOGLE_SEARCH_KEY;
+  const cx  = process.env.GOOGLE_SEARCH_CX;
+  if(!key||!cx) return [];
+  const results = [];
+  const queries = [
+    'React developer job "United States" site:lever.co OR site:greenhouse.io',
+    'Node.js engineer hiring "remote" site:lever.co OR site:workable.com',
+    '"looking to hire" developer USA startup 2025',
+  ];
+  for(const q of queries){
+    try{
+      const r = await axios.get('https://www.googleapis.com/customsearch/v1',{
+        params:{key,cx,q,num:10},timeout:10000
+      });
+      const items = r.data?.items||[];
+      for(const item of items){
+        const atMatch = (item.title||'').match(/ at ([A-Z][A-Za-z0-9\s&]+?)(?:\s*[-|·])/);
+        if(atMatch) results.push({company:atMatch[1].trim(),source:'google',notes:item.title});
+      }
+    }catch(e){}
+    await new Promise(r=>setTimeout(r,1000));
+  }
+  return results;
+}
+
+// ── Master scraper ────────────────────────────────────────────────────────
 async function scrapeAllJobBoards(){
-  dbLog('🌐','Job board scrape started','Indeed + Google + YC + Wellfound + LinkedIn Jobs');
-  
-  const [indeed, google, yc, wellfound, linkedin] = await Promise.allSettled([
+  dbLog('🌐','Job scrape started','Indeed RSS + HackerNews + YC + RemoteOK + Greenhouse');
+
+  const [indeed, hn, yc, remote, greenhouse, google] = await Promise.allSettled([
     scrapeIndeed(),
-    scrapeGoogle(),
+    scrapeHNHiring(),
     scrapeYC(),
-    scrapeWellfound(),
-    scrapeLinkedInJobs(),
+    scrapeRemoteOK(),
+    scrapeGreenhouse(),
+    scrapeGoogleCustom(),
   ]);
 
-  // Combine all results
   const all = [
     ...(indeed.value||[]),
-    ...(google.value||[]),
+    ...(hn.value||[]),
     ...(yc.value||[]),
-    ...(wellfound.value||[]),
-    ...(linkedin.value||[]),
+    ...(remote.value||[]),
+    ...(greenhouse.value||[]),
+    ...(google.value||[]),
   ];
 
-  // Deduplicate by company name
+  // Deduplicate
   const seen = new Set();
   const unique = all.filter(r=>{
     const key = r.company.toLowerCase().trim();
-    if(seen.has(key)||leadExists(r.company)) return false;
+    if(!key||key.length<2||seen.has(key)||leadExists(r.company)) return false;
     seen.add(key);
     return true;
   });
 
-  dbLog('📊','Scrape results',`${all.length} total → ${unique.length} new unique companies`);
+  dbLog('📊','Scrape complete',`${all.length} total → ${unique.length} new unique companies`);
 
-  // Import into database
   let added = 0;
   for(const co of unique){
-    if(!co.company || co.company.length < 2) continue;
     const r = insertLead({
-      company: co.company,
-      website: co.website||null,
-      industry: 'Technology',
-      size: null,
-      location: co.location||'USA',
-      source: co.source,
-      notes: co.notes||`Found via ${co.source} — actively hiring developers`,
+      company:co.company, website:co.website||null,
+      industry:'Technology', size:null,
+      location:co.location||'USA', source:co.source,
+      notes:co.notes||`Actively hiring developers — found via ${co.source}`,
     });
-    // Add a placeholder contact to find later
     insertContact({
-      lead_id: r.lastInsertRowid,
-      name: 'Unknown',
-      first_name: 'there',
-      role: 'CTO / HR Manager',
-      email: null,
-      linkedin: null,
+      lead_id:r.lastInsertRowid, name:'Unknown',
+      first_name:'there', role:'CTO / HR Manager',
+      email:null, linkedin:null,
     });
     added++;
   }
 
-  dbLog('✅','Job board import done',`${added} new companies added to pipeline`);
-  return { total: all.length, unique: unique.length, added };
+  dbLog('✅','Import done',`${added} new companies added`);
+  return {total:all.length, unique:unique.length, added};
 }
 
 // ── Agent ─────────────────────────────────────────────────────────────────
