@@ -631,6 +631,28 @@ app.post('/api/import/csv', upload.single('file'), async(req,res)=>{
 
 // Hunter enrichment endpoint
 app.post('/api/scrape',async(req,res)=>{try{res.json({ok:true,...await scrapeAllJobBoards()});}catch(e){res.json({ok:false,error:e.message});}});
+
+// GET test for Google Search — open in browser to test
+app.get('/api/test/google',async(req,res)=>{
+  const key = process.env.GOOGLE_SEARCH_KEY;
+  const cx  = process.env.GOOGLE_SEARCH_CX;
+  if(!key) return res.json({ok:false,error:'GOOGLE_SEARCH_KEY not set in Railway'});
+  if(!cx)  return res.json({ok:false,error:'GOOGLE_SEARCH_CX not set in Railway'});
+  try{
+    const r = await axios.get('https://www.googleapis.com/customsearch/v1',{
+      params:{ key, cx, q:'React developer hiring USA', num:3 },
+      timeout:15000
+    });
+    const items = r.data?.items||[];
+    res.json({
+      ok:true,
+      message:`Google Search working! Found ${items.length} results`,
+      sample: items.slice(0,2).map(i=>({title:i.title,link:i.link}))
+    });
+  }catch(e){
+    res.json({ok:false,error:e.response?.data?.error?.message||e.message, details:e.response?.data});
+  }
+});
 app.post('/api/scrape/indeed',async(req,res)=>{try{const r=await scrapeIndeed();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
 app.post('/api/scrape/google',async(req,res)=>{try{const r=await scrapeGoogle();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
 app.post('/api/scrape/yc',async(req,res)=>{try{const r=await scrapeYC();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
