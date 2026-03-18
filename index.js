@@ -25,7 +25,12 @@ function getRecentActivity(limit=50){return db.get('activity_log').value().slice
 function getStats(){const l=db.get('leads').value(),c=db.get('contacts').value(),e=db.get('emails').value();return{total_leads:l.length,total_contacts:c.length,emails_found:c.filter(x=>x.email).length,contacted:c.filter(x=>x.emails_sent>0).length,total_sent:c.reduce((a,x)=>a+(x.emails_sent||0),0),followups_due:c.filter(x=>x.status==='followup').length,total_replies:c.filter(x=>x.status==='replied').length,emails_out:e.filter(x=>x.direction==='out').length};}
 
 // ── Email templates ───────────────────────────────────────────────────────
-const TPLS={1:{sub:'IT Staff Augmentation for {{company_name}}?',body:'Hi {{first_name}},\n\nI noticed {{company_name}} is actively building its tech team.\n\nWe help US companies staff up with pre-vetted IT professionals (React, Node.js, Python, DevOps, QA) ready in 5-7 business days — 40-60% less than full-time hiring.\n\nOpen to a quick 15-min call this week?\n\nBest,\n{{your_name}}\n{{your_company}}\n{{your_phone}} · {{your_website}}'},2:{sub:'Re: IT Staff Augmentation for {{company_name}}?',body:'Hi {{first_name}},\n\nFollowing up — we recently helped a SaaS company stand up a 3-person React + Node team in under a week.\n\nWorth a 15-min call?\n\n{{your_name}}\n{{your_company}}'},3:{sub:'One more thought — {{company_name}}',body:'Hi {{first_name}},\n\nOur clients say the biggest win is scaling back down just as fast — no layoffs, no notice periods.\n\nHappy to send a one-pager.\n\n{{your_name}}\n{{your_company}}'},4:{sub:'Closing the loop — {{company_name}}',body:'Hi {{first_name}},\n\nI\'ll leave it here — if IT staffing needs come up, feel free to reach out anytime.\n\nWishing {{company_name}} all the best.\n\n{{your_name}}\n{{your_company}}'}};
+const TPLS={
+  1:{sub:'IT Outsourcing Services for {{company_name}}?',body:'Hi {{first_name}},\n\nI noticed {{company_name}} is looking for IT support — we can help.\n\nByteOn Technologies provides IT outsourcing services including:\n\u2022 Software Development (React, Node.js, Python, Java, Mobile)\n\u2022 QA & Testing | DevOps & Cloud (AWS, Azure, GCP)\n\u2022 IT Support & Managed Services | Data Engineering & AI\n\u2022 Cybersecurity | Project Management\n\nAll resources are pre-vetted, ready in 5-7 business days, 40-60% less than full-time hiring.\n\nWould you be open to a quick 15-min call this week?\n\nBest,\n{{your_name}}\n{{your_company}}\n{{your_phone}} | {{your_website}}'},
+  2:{sub:'Re: IT Outsourcing for {{company_name}}',body:'Hi {{first_name}},\n\nFollowing up on my previous note.\n\nWe recently helped a US company cut IT costs by 50% by switching to our outsourcing model — same quality, fraction of the cost, zero hiring overhead.\n\nWhether you need 1 resource or a full team, ready in under a week.\n\nWorth a 15-min call?\n\n{{your_name}}\n{{your_company}}'},
+  3:{sub:'One more thought — {{company_name}}',body:"Hi {{first_name}},\n\nThe biggest advantage our clients mention is flexibility — scale up when you need more capacity, scale down when you don't. No layoffs, no notice periods.\n\nHappy to send a one-pager on our services and pricing.\n\n{{your_name}}\n{{your_company}}"},
+  4:{sub:'Closing the loop — {{company_name}}',body:"Hi {{first_name}},\n\nI'll leave it here — if IT outsourcing needs come up in the future, feel free to reach out.\n\nWishing {{company_name}} all the best.\n\n{{your_name}}\n{{your_company}}"}
+}
 function fillTpl(t,v){let s=t.sub,b=t.body;for(const[k,val]of Object.entries(v)){s=s.replaceAll(`{{${k}}}`,val||'');b=b.replaceAll(`{{${k}}}`,val||'');}return{subject:s,body:b};}
 
 // ── SMTP ──────────────────────────────────────────────────────────────────
@@ -269,9 +274,27 @@ function leadExists(company){
 async function scrapeIndeed(){
   const results = [];
   const keywords = [
-    'React+developer','Node.js+developer','Python+developer',
-    'Full+stack+developer','DevOps+engineer','Software+engineer',
-    'Mobile+developer','Backend+developer'
+    // Direct outsourcing intent — highest priority
+    'IT+outsourcing+services','IT+staff+augmentation','managed+IT+services',
+    'contract+IT+services','IT+vendor+remote','outsource+IT+team',
+    // Development — remote contract
+    'React+developer+remote+contract','Node.js+developer+remote+contract',
+    'Python+developer+remote+contract','Full+stack+developer+remote',
+    'Software+engineer+remote+contract','Java+developer+remote+contract',
+    'Mobile+developer+remote+contract','PHP+developer+remote',
+    // DevOps & Cloud
+    'DevOps+engineer+remote+contract','AWS+engineer+remote',
+    'Cloud+engineer+remote+contract','Azure+engineer+remote',
+    // QA
+    'QA+engineer+remote+contract','software+tester+remote',
+    // Data & AI
+    'data+engineer+remote+contract','AI+developer+remote',
+    // IT Support
+    'IT+support+remote+contract','helpdesk+remote+outsource',
+    // Cybersecurity
+    'cybersecurity+engineer+remote+contract',
+    // PM
+    'IT+project+manager+remote+contract','scrum+master+remote+contract',
   ];
   for(const kw of keywords){
     try{
@@ -363,7 +386,16 @@ async function scrapeRemoteOK(){
       timeout:20000
     });
     const jobs = Array.isArray(r.data)?r.data.filter(j=>j.company):[];
-    const keywords = ['react','node','python','javascript','typescript','devops','backend','fullstack'];
+    // RemoteOK is already 100% remote — perfect for us
+  // Filter: all IT services, $20+/hr
+  const keywords = [
+    'react','node','python','javascript','typescript',
+    'devops','backend','fullstack','frontend','mobile',
+    'qa','cloud','aws','azure','gcp','data','ai','machine-learning',
+    'java','php','ruby','golang','rust','kotlin','swift',
+    'cybersecurity','project-manager','scrum',
+    'it-support','managed-services','staff-augmentation',
+  ];
     for(const job of jobs.slice(0,100)){
       const text = `${job.position||''} ${job.tags?.join(' ')||''}`.toLowerCase();
       const relevant = keywords.some(k=>text.includes(k));
@@ -394,9 +426,14 @@ async function scrapeGreenhouse(){
   const companies = [
     'airbnb','stripe','twilio','shopify','hubspot','zendesk','intercom',
     'squarespace','asana','figma','notion','linear','vercel','netlify',
-    'planetscale','supabase','clerk','resend','postmark','segment'
+    'planetscale','supabase','clerk','resend','postmark','segment',
+    'datadog','newrelic','pagerduty','atlassian','servicenow','okta',
+    'cloudflare','fastly','hashicorp','mongodb','elastic','snowflake',
   ];
-  const keywords = ['react','node','python','engineer','developer','devops','backend','frontend'];
+  const keywords = [
+    'react','node','python','engineer','developer','devops','backend','frontend',
+    'qa','cloud','data','mobile','java','security','support','manager','scrum',
+  ];
   for(const co of companies.slice(0,10)){
     try{
       const r = await axios.get(`https://boards-api.greenhouse.io/v1/boards/${co}/jobs`,{timeout:8000});
@@ -425,87 +462,131 @@ async function scrapeGreenhouse(){
 async function scrapeGoogleCustom(){
   const key = process.env.GOOGLE_SEARCH_KEY;
   const cx  = process.env.GOOGLE_SEARCH_CX;
-  if(!key||!cx){ dbLog('⚠️','Google Search','Keys not set'); return []; }
-
+  if(!key||!cx) return [];
   const results = [];
-  const queries = [
-    // Job boards — companies actively hiring developers
-    '"React developer" hiring "United States" site:lever.co OR site:greenhouse.io',
-    '"Node.js developer" hiring remote USA site:lever.co OR site:greenhouse.io',
-    '"Python developer" hiring USA site:ashbyhq.com OR site:lever.co',
-    '"DevOps engineer" hiring remote USA site:lever.co OR site:workable.com',
-    '"Full stack developer" hiring USA site:greenhouse.io OR site:workable.com',
-    '"Mobile developer" hiring USA remote site:lever.co OR site:greenhouse.io',
-    // LinkedIn posts — people posting hiring needs with salary
-    'site:linkedin.com "looking for developer" "per hour" 2025',
-    'site:linkedin.com "need a developer" remote 2025',
-    'site:linkedin.com "we are hiring" "React" OR "Node.js" OR "Python" 2025',
-    'site:linkedin.com "outsource" developer "per hour" 2025',
-    // Salary-based searches — the "$35/hr" type posts you mentioned
-    '"need developer" "$35" OR "$40" OR "$45" OR "$50" "per hour" remote',
-    '"hire developer" "$" "per hour" USA 2025',
-    '"IT outsourcing" "looking for" developer USA 2025',
-    '"staff augmentation" developer USA remote 2025',
+
+  // Broad IT outsourcing queries — any IT service, $20+/hr minimum
+  const allQueries = [
+    // Direct outsourcing intent
+    '"looking for" "IT outsourcing" "$" site:linkedin.com',
+    '"looking to outsource" IT services company USA',
+    '"need IT support" outsource "$20" OR "$25" OR "$30" per hour',
+    '"managed IT services" "looking for" vendor partner USA',
+    '"IT staff augmentation" "looking for" provider USA',
+    // Developer roles $20+
+    '"hiring" developer "$20" OR "$25" OR "$30" OR "$35" OR "$40" per hour remote',
+    '"contract developer" "$" per hour remote USA 2025',
+    '"freelance developer" needed "$20" OR "$25" OR "$30" per hour',
+    // QA and Testing
+    '"QA engineer" OR "software tester" "$" per hour remote USA',
+    '"quality assurance" outsource "$20" per hour',
+    // DevOps and Cloud
+    '"DevOps engineer" OR "cloud engineer" "$" per hour remote contract',
+    '"AWS" OR "Azure" OR "GCP" engineer outsource "$" per hour USA',
+    // IT Support and Helpdesk
+    '"IT support" OR "helpdesk" outsource "$" per hour USA',
+    '"managed services" OR "IT helpdesk" vendor looking USA',
+    // Data and AI
+    '"data engineer" OR "data scientist" "$" per hour remote contract USA',
+    '"AI developer" OR "ML engineer" outsource "$" per hour',
+    // Project Management
+    '"IT project manager" OR "scrum master" "$" per hour contract remote',
+    // Cybersecurity
+    '"cybersecurity" OR "penetration testing" outsource "$" per hour USA',
+    // Mobile
+    '"mobile developer" OR "iOS developer" OR "Android developer" "$" per hour remote',
+    // LinkedIn posts about outsourcing
+    'site:linkedin.com/posts "looking to outsource" IT 2025',
+    'site:linkedin.com/posts "need IT services" outsource "$"',
+    'site:linkedin.com/posts "IT vendor" OR "IT partner" looking USA',
+    // Facebook groups
+    'site:facebook.com "IT outsourcing" "looking for" "$" per hour',
+    // General high intent
+    '"we are looking for" "IT services" vendor USA "$20" OR "$25" OR "$30"',
+    '"third party" IT services "looking for" USA company',
   ];
 
-  for(const q of queries){
-    try{
-      const r = await axios.get('https://www.googleapis.com/customsearch/v1',{
-        params:{ key, cx, q, num:10 },
-        timeout:15000
-      });
-      const items = r.data?.items||[];
-      dbLog('🔎','Google',`"${q.substring(0,40)}..." — ${items.length} results`);
-
-      for(const item of items){
-        const title   = item.title||'';
-        const snippet = item.snippet||'';
-        const link    = item.link||'';
-        const text    = title+' '+snippet;
-
-        let company='', jobTitle='';
-        const atMatch   = title.match(/^(.+?)\s+at\s+([A-Z][A-Za-z0-9\s&,\.]+?)(?:\s*[-|]|$)/);
-        const pipeMatch = title.match(/^([A-Z][A-Za-z0-9\s&,\.]+?)\s*[|]\s*(.+)/);
-        const dashMatch = title.match(/^(.+?)\s*[-]\s*([A-Z][A-Za-z0-9\s&,\.]{2,40})(?:\s*[-|]|$)/);
-
-        if(atMatch){ jobTitle=atMatch[1].trim(); company=atMatch[2].trim(); }
-        else if(pipeMatch){ company=pipeMatch[1].trim(); jobTitle=pipeMatch[2].trim(); }
-        else if(dashMatch){ jobTitle=dashMatch[1].trim(); company=dashMatch[2].trim(); }
-
-        if(!company || company.length<2 || company.length>60) continue;
-        const skip=['Google','Indeed','LinkedIn','Glassdoor','ZipRecruiter','Facebook','Twitter'];
-        if(skip.some(s=>company.includes(s))) continue;
-
-        const salaryM = text.match(/\$(\d+)(?:-(\d+))?\s*(?:\/hr|\/hour|per hour)/i);
-        const salary  = salaryM ? `$${salaryM[1]}${salaryM[2]?'-$'+salaryM[2]:''}/hr` : '';
-        const expM    = text.match(/(\d+)\+?\s*years?\s*(?:of\s*)?(?:exp|experience)/i);
-        const exp     = expM ? `${expM[1]}+ years exp` : '';
-        const isLI    = link.includes('linkedin.com');
-        const isFB    = link.includes('facebook.com');
-        const src     = isLI?'linkedin_posts':isFB?'facebook':'google';
-
-        results.push({
-          company, source:src,
-          job_title: jobTitle||title.substring(0,60),
-          job_url: link,
-          job_desc: snippet.substring(0,300),
-          salary,
-          notes:[
-            `Found via Google Search (${src})`,
-            jobTitle?`Job: ${jobTitle}`:'',
-            salary?`Salary: ${salary}`:'',
-            exp?`Experience: ${exp}`:'',
-          ].filter(Boolean).join('\n'),
-        });
-      }
-    }catch(e){
-      if(e.response?.status===429){ await new Promise(r=>setTimeout(r,10000)); }
-      else dbLog('⚠️','Google error',e.message);
-    }
-    await new Promise(r=>setTimeout(r,1100));
+  // Use 5 queries per run (was 3) — still within 100/day limit
+  const day = new Date().getDate();
+  const hour = new Date().getHours();
+  const idx = ((day * 5) + Math.floor(hour/8)) % allQueries.length;
+  const todayQueries = [];
+  for(let i=0; i<5; i++){
+    todayQueries.push(allQueries[(idx+i) % allQueries.length]);
   }
 
-  dbLog('🔎','Google Search done',`${results.length} companies found`);
+  dbLog('🔎','Google Search', `Searching for IT outsourcing leads — ${todayQueries.length} queries`);
+
+  for(const q of todayQueries){
+    try{
+      const r = await axios.get('https://www.googleapis.com/customsearch/v1',{
+        params:{ key, cx, q, num:10 }, timeout:15000
+      });
+      const items = r.data?.items||[];
+      for(const item of items){
+        const title = item.title||'';
+        const link  = item.link||'';
+        const desc  = item.snippet||'';
+        const text  = (title+' '+desc).toLowerCase();
+
+        // Skip if salary is below $20/hr
+        const salaryNums = (title+' '+desc).match(/\$(\d+)(?:\/hr|\/hour| per hour)/gi)||[];
+        const salaryValues = salaryNums.map(s=>parseInt(s.replace(/\D/g,'')));
+        const maxSalary = salaryValues.length>0 ? Math.max(...salaryValues) : null;
+        if(maxSalary !== null && maxSalary < 20) continue; // skip below $20/hr
+
+        // Extract company name
+        let company = '';
+        const m1 = title.match(/ at ([A-Z][A-Za-z0-9 &,.]+?)(?:\s*[-|])/);
+        const m2 = title.match(/^([A-Z][A-Za-z0-9 &]+?) [-] /);
+        const m3 = desc.match(/([A-Z][A-Za-z0-9 &]+?) is (?:looking|hiring|seeking|need)/);
+        const m4 = desc.match(/([A-Z][A-Za-z0-9 &]+?) (?:company|startup|inc|llc|corp)/i);
+        company = (m1&&m1[1])||(m2&&m2[1])||(m3&&m3[1])||(m4&&m4[1])||'';
+        company = company.trim().replace(/\.$/, '');
+
+        if(company && company.length>2 && company.length<60){
+          // Extract salary range
+          const salaryMatch = (title+' '+desc).match(/\$[\d,]+(?:\s*-\s*\$[\d,]+)?(?:\/hr|\/hour|k| per hour)?/i);
+          const salary = salaryMatch ? salaryMatch[0] : '';
+
+          // Detect work type
+          const workType = text.includes('remote')?'Remote':text.includes('hybrid')?'Hybrid':'On-site';
+
+          // Detect IT service type
+          const serviceTypes = [];
+          if(text.match(/develop|engineer|programmer|coder/)) serviceTypes.push('Development');
+          if(text.match(/qa|tester|quality/)) serviceTypes.push('QA');
+          if(text.match(/devops|cloud|aws|azure|gcp/)) serviceTypes.push('DevOps/Cloud');
+          if(text.match(/support|helpdesk|it support/)) serviceTypes.push('IT Support');
+          if(text.match(/data|analytics|ml|ai|machine learning/)) serviceTypes.push('Data/AI');
+          if(text.match(/security|cyber|pentest/)) serviceTypes.push('Cybersecurity');
+          if(text.match(/project manager|scrum|agile/)) serviceTypes.push('PM/Scrum');
+          if(text.match(/mobile|ios|android|flutter/)) serviceTypes.push('Mobile');
+          if(text.match(/outsourc|augment|vendor|partner|third.party/)) serviceTypes.push('Outsourcing');
+          const serviceLabel = serviceTypes.length>0 ? serviceTypes.join(', ') : 'IT Services';
+
+          results.push({
+            company, source:'google',
+            job_url: link,
+            job_title: `${serviceLabel} — ${title.substring(0,60)}`,
+            job_desc: desc.substring(0,250),
+            salary, location: workType+' / USA',
+            notes: `Google: ${title.substring(0,80)}${salary?' · '+salary:''}${workType?' · '+workType:''}`,
+          });
+        }
+      }
+      dbLog('🔎','Google query done',`"${q.substring(0,50)}"`);
+    }catch(e){
+      if(e.response&&e.response.status===429){
+        dbLog('⚠️','Google quota reached','Daily limit hit — resets at midnight');
+        break;
+      }
+      dbLog('⚠️','Google error',e.message);
+    }
+    await new Promise(r=>setTimeout(r,1000));
+  }
+
+  dbLog('🔎','Google done',`${results.length} IT outsourcing leads found`);
   return results;
 }
 // ── Master scraper ────────────────────────────────────────────────────────
@@ -604,6 +685,88 @@ app.patch('/api/contacts/:id/email',(req,res)=>{updateContactEmail(req.params.id
 app.patch('/api/contacts/:id/replied',(req,res)=>{markContactReplied(req.params.id);res.json({ok:true});});
 app.post('/api/contacts/:id/send',async(req,res)=>{const c=getContactById(req.params.id);if(!c)return res.status(404).json({error:'Not found'});if(!c.email)return res.status(400).json({error:'No email'});const l=getLeadById(c.lead_id);res.json(await sendEmail({contact:c,lead:l,emailNum:c.emails_sent+1}));});
 app.get('/api/activity',(req,res)=>res.json(getRecentActivity(parseInt(req.query.limit)||50)));
+// ── AI Personalised Email Generator ──────────────────────────────────────
+app.post('/api/ai/generate-email',async(req,res)=>{
+  const {lead_id, contact_id, email_num} = req.body;
+  if(!lead_id) return res.status(400).json({error:'lead_id required'});
+
+  const lead = getLeadById(lead_id);
+  const contacts = getContactsByLeadId(lead_id);
+  const contact = contact_id ? contacts.find(c=>c.id===Number(contact_id)) : contacts[0];
+  if(!lead) return res.status(404).json({error:'Lead not found'});
+
+  // Parse job details from notes
+  const notes = lead.notes||'';
+  const jobTitle = notes.match(/Job Title: (.+)/)?.[1]||'';
+  const jobDesc  = notes.match(/Description: ([\s\S]+?)(?:
+Salary:|
+Posted:|$)/)?.[1]||'';
+  const salary   = notes.match(/Salary: (.+)/)?.[1]||'';
+  const source   = lead.source||'';
+
+  const prompt = `You are a business development expert writing a cold outreach email on behalf of ByteOn Technologies, an IT outsourcing company.
+
+COMPANY WE ARE CONTACTING:
+- Company: ${lead.company}
+- Industry: ${lead.industry||'Technology'}
+- Location: ${lead.location||'USA'}
+- Contact: ${contact?.name||'there'} (${contact?.role||'Decision Maker'})
+- Source: Found via ${source} job posting
+${jobTitle ? `- Job they posted: ${jobTitle}` : ''}
+${salary ? `- Salary they mentioned: ${salary}` : ''}
+${jobDesc ? `- Job description: ${jobDesc.substring(0,300)}` : ''}
+
+OUR COMPANY (ByteOn Technologies):
+- We provide IT outsourcing services: Software Development, QA, DevOps, Cloud, IT Support, Data Engineering, Cybersecurity, Project Management
+- Resources ready in 5-7 business days
+- 40-60% less cost than full-time hiring
+- Remote delivery model
+- Website: byteonai.com
+
+TASK: Write email #${email_num||1} in the outreach sequence.
+${email_num===1||!email_num ? 'This is the FIRST email — introduce ourselves and reference their specific job posting/requirement.' : ''}
+${email_num===2 ? 'This is FOLLOW-UP #1 (Day 3) — they did not reply. Add value, mention a specific benefit.' : ''}
+${email_num===3 ? 'This is FOLLOW-UP #2 (Day 7) — still no reply. Keep it short, different angle.' : ''}
+${email_num===4 ? 'This is the FINAL email (Day 14) — short break-up email.' : ''}
+
+RULES:
+- Maximum 150 words
+- Reference their SPECIFIC job post or requirement if available
+- Sound human, not salesy
+- One clear call to action (15-min call)
+- Do NOT use generic phrases like "I hope this email finds you well"
+- Sign as: Anas, ByteOn Technologies
+
+Respond with JSON only:
+{
+  "subject": "email subject line",
+  "body": "email body text"
+}`;
+
+  try{
+    const r = await axios.post('https://api.anthropic.com/v1/messages',{
+      model:'claude-sonnet-4-20250514',
+      max_tokens:500,
+      messages:[{role:'user',content:prompt}]
+    },{
+      headers:{
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version':'2023-06-01',
+        'content-type':'application/json'
+      },
+      timeout:30000
+    });
+
+    const text = r.data?.content?.[0]?.text||'{}';
+    const clean = text.replace(/```json|```/g,'').trim();
+    const parsed = JSON.parse(clean);
+    res.json({ok:true, subject:parsed.subject, body:parsed.body});
+  }catch(e){
+    dbLog('❌','AI email gen failed',e.message);
+    res.json({ok:false, error:e.response?.data?.error?.message||e.message});
+  }
+});
+
 app.post('/api/agent/run',async(req,res)=>{const d=req.body?.dry_run===true;runAgentCycle({dryRun:d}).catch(console.error);res.json({ok:true,message:d?'Dry run started':'Agent started'});});
 app.post('/api/agent/check-replies',async(req,res)=>res.json({ok:true,replies_found:await checkForReplies()}));
 app.get('/api/test/gmail',async(req,res)=>res.json(await testSmtp()));
