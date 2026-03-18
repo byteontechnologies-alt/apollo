@@ -421,33 +421,93 @@ async function scrapeGreenhouse(){
   return results;
 }
 
-// ── 6. Google Custom Search API (optional — needs key) ───────────────────
+// ── 6. Google Custom Search API ──────────────────────────────────────────
 async function scrapeGoogleCustom(){
   const key = process.env.GOOGLE_SEARCH_KEY;
   const cx  = process.env.GOOGLE_SEARCH_CX;
-  if(!key||!cx) return [];
+  if(!key||!cx){ dbLog('⚠️','Google Search','Keys not set'); return []; }
+
   const results = [];
   const queries = [
-    'React developer job "United States" site:lever.co OR site:greenhouse.io',
-    'Node.js engineer hiring "remote" site:lever.co OR site:workable.com',
-    '"looking to hire" developer USA startup 2025',
+    // Job boards — companies actively hiring developers
+    '"React developer" hiring "United States" site:lever.co OR site:greenhouse.io',
+    '"Node.js developer" hiring remote USA site:lever.co OR site:greenhouse.io',
+    '"Python developer" hiring USA site:ashbyhq.com OR site:lever.co',
+    '"DevOps engineer" hiring remote USA site:lever.co OR site:workable.com',
+    '"Full stack developer" hiring USA site:greenhouse.io OR site:workable.com',
+    '"Mobile developer" hiring USA remote site:lever.co OR site:greenhouse.io',
+    // LinkedIn posts — people posting hiring needs with salary
+    'site:linkedin.com "looking for developer" "per hour" 2025',
+    'site:linkedin.com "need a developer" remote 2025',
+    'site:linkedin.com "we are hiring" "React" OR "Node.js" OR "Python" 2025',
+    'site:linkedin.com "outsource" developer "per hour" 2025',
+    // Salary-based searches — the "$35/hr" type posts you mentioned
+    '"need developer" "$35" OR "$40" OR "$45" OR "$50" "per hour" remote',
+    '"hire developer" "$" "per hour" USA 2025',
+    '"IT outsourcing" "looking for" developer USA 2025',
+    '"staff augmentation" developer USA remote 2025',
   ];
+
   for(const q of queries){
     try{
       const r = await axios.get('https://www.googleapis.com/customsearch/v1',{
-        params:{key,cx,q,num:10},timeout:10000
+        params:{ key, cx, q, num:10 },
+        timeout:15000
       });
       const items = r.data?.items||[];
+      dbLog('🔎','Google',`"${q.substring(0,40)}..." — ${items.length} results`);
+
       for(const item of items){
-        const atMatch = (item.title||'').match(/ at ([A-Z][A-Za-z0-9\s&]+?)(?:\s*[-|·])/);
-        if(atMatch) results.push({company:atMatch[1].trim(),source:'google',notes:item.title});
+        const title   = item.title||'';
+        const snippet = item.snippet||'';
+        const link    = item.link||'';
+        const text    = title+' '+snippet;
+
+        let company='', jobTitle='';
+        const atMatch   = title.match(/^(.+?)\s+at\s+([A-Z][A-Za-z0-9\s&,\.]+?)(?:\s*[-|]|$)/);
+        const pipeMatch = title.match(/^([A-Z][A-Za-z0-9\s&,\.]+?)\s*[|]\s*(.+)/);
+        const dashMatch = title.match(/^(.+?)\s*[-]\s*([A-Z][A-Za-z0-9\s&,\.]{2,40})(?:\s*[-|]|$)/);
+
+        if(atMatch){ jobTitle=atMatch[1].trim(); company=atMatch[2].trim(); }
+        else if(pipeMatch){ company=pipeMatch[1].trim(); jobTitle=pipeMatch[2].trim(); }
+        else if(dashMatch){ jobTitle=dashMatch[1].trim(); company=dashMatch[2].trim(); }
+
+        if(!company || company.length<2 || company.length>60) continue;
+        const skip=['Google','Indeed','LinkedIn','Glassdoor','ZipRecruiter','Facebook','Twitter'];
+        if(skip.some(s=>company.includes(s))) continue;
+
+        const salaryM = text.match(/\$(\d+)(?:-(\d+))?\s*(?:\/hr|\/hour|per hour)/i);
+        const salary  = salaryM ? `$${salaryM[1]}${salaryM[2]?'-$'+salaryM[2]:''}/hr` : '';
+        const expM    = text.match(/(\d+)\+?\s*years?\s*(?:of\s*)?(?:exp|experience)/i);
+        const exp     = expM ? `${expM[1]}+ years exp` : '';
+        const isLI    = link.includes('linkedin.com');
+        const isFB    = link.includes('facebook.com');
+        const src     = isLI?'linkedin_posts':isFB?'facebook':'google';
+
+        results.push({
+          company, source:src,
+          job_title: jobTitle||title.substring(0,60),
+          job_url: link,
+          job_desc: snippet.substring(0,300),
+          salary,
+          notes:[
+            `Found via Google Search (${src})`,
+            jobTitle?`Job: ${jobTitle}`:'',
+            salary?`Salary: ${salary}`:'',
+            exp?`Experience: ${exp}`:'',
+          ].filter(Boolean).join('\n'),
+        });
       }
-    }catch(e){}
-    await new Promise(r=>setTimeout(r,1000));
+    }catch(e){
+      if(e.response?.status===429){ await new Promise(r=>setTimeout(r,10000)); }
+      else dbLog('⚠️','Google error',e.message);
+    }
+    await new Promise(r=>setTimeout(r,1100));
   }
+
+  dbLog('🔎','Google Search done',`${results.length} companies found`);
   return results;
 }
-
 // ── Master scraper ────────────────────────────────────────────────────────
 async function scrapeAllJobBoards(){
   dbLog('🌐','Job scrape started','Indeed RSS + HackerNews + YC + RemoteOK + Greenhouse');
