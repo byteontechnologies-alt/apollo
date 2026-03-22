@@ -568,40 +568,18 @@ async function scrapeGoogleCustom(){
   // ── Remote-only queries (all include "remote" keyword) ────────────────
   // These are designed to return ONLY remote roles — no on-site, no hybrid
   const allQueries = [
-    // Direct outsourcing intent — remote
-    '"IT outsourcing" "remote" "looking for" vendor USA',
-    '"IT staff augmentation" remote provider USA 2026',
-    '"managed IT services" remote vendor "looking for" USA',
-    // Developer hiring — remote contract only
-    '"hiring" "remote" developer contract "$" per hour USA',
-    '"remote" "contract developer" "$20" OR "$30" OR "$40" per hour USA',
-    '"remote" "full stack developer" contract outsource USA',
-    '"remote" "React developer" contract hiring USA 2026',
-    '"remote" "Node.js developer" contract "$" per hour',
-    '"remote" "Python developer" contract hiring USA',
-    // DevOps & Cloud — remote
-    '"remote" "DevOps engineer" contract "$" per hour USA',
-    '"remote" "AWS engineer" OR "cloud engineer" contract outsource',
-    // QA — remote
-    '"remote" "QA engineer" contract "$" per hour USA',
-    '"remote" "software tester" outsource "$" per hour',
-    // Data & AI — remote
-    '"remote" "data engineer" contract "$" per hour USA',
-    '"remote" "AI developer" OR "ML engineer" contract outsource',
-    // IT Support — remote
-    '"remote" "IT support" outsource "$" per hour USA',
-    '"remote" helpdesk outsource vendor USA',
-    // Cybersecurity — remote
-    '"remote" cybersecurity engineer contract "$" per hour USA',
-    // Mobile — remote
-    '"remote" "mobile developer" OR "iOS developer" contract "$" per hour',
-    // LinkedIn remote posts
-    'site:linkedin.com/posts "remote" "looking to outsource" IT 2026',
-    'site:linkedin.com/posts "remote" "IT vendor" OR "IT partner" USA',
-    // High intent — remote explicit
-    '"we are looking for" "remote" "IT services" vendor USA',
-    '"third party" "remote" IT services "looking for" USA',
-    '"outsource" "remote team" IT developer USA 2026',
+    // Target ATS/job board pages directly — these are ACTUAL job postings, not articles
+    'site:lever.co "remote" "software engineer" OR "developer" OR "devops"',
+    'site:greenhouse.io "remote" "software engineer" OR "developer" OR "devops"',
+    'site:boards.greenhouse.io "remote" engineer developer',
+    'site:jobs.ashbyhq.com "remote" engineer developer',
+    'site:workable.com "remote" "software engineer" OR "developer"',
+    'site:apply.workable.com "remote" developer engineer',
+    'site:jobs.lever.co "remote" developer engineer QA devops',
+    'site:wellfound.com/jobs "remote" "software engineer" OR "developer"',
+    'site:weworkremotely.com/jobs "developer" OR "engineer" OR "devops"',
+    'site:remotive.com/jobs "developer" OR "engineer" OR "devops"',
+    'site:ycombinator.com/jobs "remote" engineer developer',
   ];
 
   // Rotate through queries — 2 per run to preserve credits
@@ -638,34 +616,49 @@ async function scrapeGoogleCustom(){
         const desc  = item.snippet||'';
         const text  = (title+' '+desc).toLowerCase();
 
-        // Skip hard on-site signals only (don't require "remote" in snippet —
-        // the query already contains "remote" so Google pre-filtered for us)
+        // Skip hard on-site signals only
         const isOnsite = /\bon.?site\b|\bin.?office\b|\bin.?person\b|\bhybrid\b/.test(text);
         if(isOnsite) continue;
 
-        // Skip if salary explicitly mentioned AND below $20/hr
-        const salaryNums = (title+' '+desc).match(/\$(\d+)(?:\/hr|\/hour| per hour)/gi)||[];
-        const salaryValues = salaryNums.map(s=>parseInt(s.replace(/\D/g,'')));
-        const maxSalary = salaryValues.length>0 ? Math.max(...salaryValues) : null;
-        if(maxSalary !== null && maxSalary < 20) continue;
+        // ── Skip blog posts, articles, listicles — not job postings ──
+        const isBlog = /top \d+|best \d+|how to hire|guide to|tips for|what is|vs\.|comparison|review|\d+ picks|why outsource|benefits of outsourc|article|blog\.|\bposts\b/i.test(title);
+        if(isBlog) continue;
+        // Also skip vendor/agency sites promoting themselves
+        const isVendor = /outsourc.*compan|software.*vendor|development.*agenc|our services|hire us|contact us/i.test(title+' '+desc);
+        if(isVendor) continue;
 
-        // Extract company name — multiple strategies
+        // Extract company name — job board aware
         let company = '';
-        const m1 = title.match(/ at ([A-Z][A-Za-z0-9 &,.]+?)(?:\s*[-|])/);
-        const m2 = title.match(/^([A-Z][A-Za-z0-9 &]+?) [-–|] /);
-        const m3 = desc.match(/([A-Z][A-Za-z0-9 &]+?) is (?:looking|hiring|seeking|need)/);
-        const m4 = desc.match(/([A-Z][A-Za-z0-9 &]+?) (?:company|startup|inc|llc|corp)/i);
-        // Fallback: extract domain name from URL as company hint
-        const domainMatch = link.match(/https?:\/\/(?:www\.)?([^\/]+)/);
-        const domainHint = domainMatch ? domainMatch[1].split('.')[0] : '';
-        company = (m1&&m1[1])||(m2&&m2[1])||(m3&&m3[1])||(m4&&m4[1])||'';
-        company = company.trim().replace(/\.$/, '');
-        // Use domain as company if extraction failed and domain looks like a company
-        if(!company && domainHint && domainHint.length>2 && !['www','jobs','careers','linkedin','indeed','glassdoor','ziprecruiter','google'].includes(domainHint)){
-          company = domainHint.charAt(0).toUpperCase()+domainHint.slice(1);
+        // Job board URL patterns: lever.co/company-name, greenhouse.io/company, workable.com/company
+        const jobBoardMatch = link.match(/(?:lever\.co|greenhouse\.io|workable\.com|ashbyhq\.com|boards\.greenhouse\.io)\/([a-z0-9\-]+)/i);
+        if(jobBoardMatch) company = jobBoardMatch[1].replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
+        // LinkedIn jobs: linkedin.com/jobs/view/title-at-Company-123
+        const linkedinMatch = link.match(/linkedin\.com\/jobs\/view\/(.+?)-\d+/);
+        if(!company && linkedinMatch) {
+          const atIdx = linkedinMatch[1].lastIndexOf('-at-');
+          if(atIdx>0) company = linkedinMatch[1].substring(atIdx+4).replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
         }
+        // Title patterns: "Role at Company" or "Company - Role"
+        if(!company){
+          const m1 = title.match(/ at ([A-Z][A-Za-z0-9 &,.]+?)(?:\s*[-|]|$)/);
+          const m2 = title.match(/^([A-Z][A-Za-z0-9 &]+?) [-–|] /);
+          const m3 = desc.match(/([A-Z][A-Za-z0-9 &]+?) is (?:looking|hiring|seeking|need)/);
+          const m4 = desc.match(/([A-Z][A-Za-z0-9 &]+?) (?:company|startup|inc|llc|corp)/i);
+          company = (m1&&m1[1])||(m2&&m2[1])||(m3&&m3[1])||(m4&&m4[1])||'';
+        }
+        // Domain fallback — skip known job board domains
+        if(!company){
+          const domainMatch = link.match(/https?:\/\/(?:www\.)?([^\/]+)/);
+          const domain = domainMatch?.[1]||'';
+          const jobBoards = ['linkedin','indeed','glassdoor','greenhouse','lever','workable','ashbyhq','wellfound','angel','remotive','weworkremotely','nodesk','ycombinator','ziprecruiter','monster'];
+          const domainName = domain.split('.')[0];
+          if(!jobBoards.includes(domainName) && domainName.length>2){
+            company = domainName.charAt(0).toUpperCase()+domainName.slice(1);
+          }
+        }
+        company = company.trim().replace(/\.$/, '').substring(0,60);
 
-        if(company && company.length>2 && company.length<60){
+        if(company && company.length>2){
           const salaryMatch = (title+' '+desc).match(/\$[\d,]+(?:\s*-\s*\$[\d,]+)?(?:\/hr|\/hour|k| per hour)?/i);
           const salary = salaryMatch ? salaryMatch[0] : '';
 
