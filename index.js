@@ -801,57 +801,6 @@ app.get('/api/activity',(req,res)=>res.json(getRecentActivity(parseInt(req.query
 app.post('/api/ai/generate-email',async(req,res)=>{
   const key = process.env.GEMINI_API_KEY;
   if(!key) return res.json({ok:false,error:'GEMINI_API_KEY not set in Railway'});
-  const {lead_id,contact_id,email_num=1} = req.body;
-  const lead = getLeadById(lead_id);
-  if(!lead) return res.json({ok:false,error:'Lead not found'});
-  const contacts = getContactsByLeadId(lead_id);
-  const contact = contact_id ? contacts.find(c=>c.id===Number(contact_id)) : contacts[0];
-  const notes = lead.notes||'';
-  const jobTitle = notes.match(/Job Title: (.+)/)?.[1]||'';
-  const jobDesc  = notes.includes('Description: ') ? notes.split('Description: ')[1].split('\nSalary:')[0].split('\nPosted:')[0].trim() : '';
-  const salary   = notes.match(/Salary: (.+)/)?.[1]||'';
-
-  const prompt = `Write a cold outreach email for ByteOn Technologies (IT outsourcing company).
-
-TARGET:
-- Company: ${lead.company}
-- Contact: ${contact?.name||'there'} (${contact?.role||'Decision Maker'})
-- Their job post: ${jobTitle||'IT services role'}
-- Salary budget: ${salary||'not specified'}
-- Description: ${jobDesc.substring(0,200)||notes.substring(0,200)}
-
-OUR OFFER: IT outsourcing — developers, QA, DevOps, cloud, support, data, cybersecurity, PM. Pre-vetted, ready in 5-7 days, 40-60% cheaper than hiring.
-
-EMAIL #${email_num} rules:
-- Max 120 words
-- Reference their SPECIFIC job/requirement
-- No "I hope this email finds you well"
-- End with one question
-- Sign: Anas | ByteOn Technologies | byteonai.com
-
-${email_num===1?'First touch — introduce and hook':email_num===2?'Follow-up day 3 — add a case study or stat':email_num===3?'Follow-up day 7 — different angle, short':'Final email day 14 — short break-up, creates urgency'}
-
-Respond ONLY with JSON: {"subject":"...","body":"..."}`;
-
-  try{
-    const r = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`,
-      {contents:[{parts:[{text:prompt}]}]},
-      {headers:{'Content-Type':'application/json'},timeout:20000}
-    );
-    const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'{}';
-    const clean = text.replace(/```json|```/g,'').trim();
-    const parsed = JSON.parse(clean);
-    res.json({ok:true,subject:parsed.subject,body:parsed.body});
-  }catch(e){
-    res.json({ok:false,error:e.response?.data?.error?.message||e.message});
-  }
-});
-
-// ── Gemini AI Email Generator ────────────────────────────────────────────
-app.post('/api/ai/generate-email',async(req,res)=>{
-  const key = process.env.GEMINI_API_KEY;
-  if(!key) return res.json({ok:false,error:'GEMINI_API_KEY not set in Railway'});
 
   const {lead_id,contact_id,email_num=1} = req.body;
   const lead = getLeadById(lead_id);
@@ -863,6 +812,7 @@ app.post('/api/ai/generate-email',async(req,res)=>{
   const jobTitle = notes.match(/Job Title: (.+)/)?.[1]||'';
   const salary   = notes.match(/Salary: (.+)/)?.[1]||'';
   const jobDesc  = notes.includes('Description: ') ? notes.split('Description: ')[1].split('\nSalary:')[0].split('\nPosted:')[0].trim() : '';
+  const jobUrl   = notes.match(/Job Post: (.+)/)?.[1]||'';
 
   const prompt = `You are a BD expert writing a cold email for ByteOn Technologies, an IT outsourcing company based in India serving US/UK clients.
 
@@ -871,150 +821,41 @@ Company: ${lead.company}
 Contact: ${contact?.name||'there'} (${contact?.role||'Decision Maker'})
 ${jobTitle?'Job they posted: '+jobTitle:''}
 ${salary?'Budget: '+salary:''}
-${jobDesc?'Details: '+jobDesc.substring(0,200):''}
+${jobDesc?'Details: '+jobDesc.substring(0,250):''}
+${jobUrl?'Job post URL: '+jobUrl:''}
 
-ABOUT US: ByteOn Technologies — IT outsourcing: Dev, QA, DevOps, Cloud, IT Support, Data, Cybersecurity, PM. Resources ready in 5-7 days. 40-60% cheaper than hiring.
+ABOUT US: ByteOn Technologies — IT outsourcing: Dev, QA, DevOps, Cloud, IT Support, Data, Cybersecurity, PM. Resources ready in 5-7 days. 40-60% cheaper than hiring locally.
 
 Write email #${email_num}:
-${email_num===1?'First touch — reference their specific need, be concise under 120 words':''}
-${email_num===2?'Follow-up day 3 — add value, new angle, under 80 words':''}
-${email_num===3?'Follow-up day 7 — different pain point, under 60 words':''}
-${email_num===4?'Break-up email day 14 — creates urgency, under 50 words':''}
+${email_num===1?'First touch — reference their SPECIFIC job post or need. Be direct, concise, max 120 words.':''}
+${email_num===2?'Follow-up day 3 — add a specific stat or case study. New angle. Max 80 words.':''}
+${email_num===3?'Follow-up day 7 — address a different pain point (speed, quality, flexibility). Max 60 words.':''}
+${email_num===4?'Break-up email day 14 — short, creates mild urgency, leaves door open. Max 50 words.':''}
 
-Rules: Sound human not salesy. No "I hope this finds you well". One clear CTA (15-min call). Sign as Anas, ByteOn Technologies, byteonai.com
+Rules:
+- Sound like a real human, not a sales robot
+- NO "I hope this finds you well" or similar openers
+- Reference ${lead.company} specifically
+- One clear CTA: 15-min call
+- Sign as: Anas | ByteOn Technologies | byteonai.com
 
-Respond ONLY with JSON: {"subject":"...","body":"..."}`;
-
-  try{
-    const r = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`,
-      {contents:[{parts:[{text:prompt}]}]},
-      {headers:{'Content-Type':'application/json'},timeout:30000}
-    );
-    const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'{}';
-    const clean = text.replace(/```json|```/g,'').trim();
-    const parsed = JSON.parse(clean);
-    dbLog('🤖','Gemini email generated',`${lead.company} — email #${email_num}`);
-    res.json({ok:true,subject:parsed.subject,body:parsed.body});
-  }catch(e){
-    dbLog('❌','Gemini failed',e.message);
-    res.json({ok:false,error:e.response?.data?.error?.message||e.message});
-  }
-});
-
-// ── Gemini AI Email Generator ─────────────────────────────────────────────
-app.post('/api/ai/generate-email',async(req,res)=>{
-  const {lead_id,contact_id,email_num=1} = req.body;
-  const key = process.env.GEMINI_API_KEY;
-  if(!key) return res.json({ok:false,error:'GEMINI_API_KEY not set in Railway variables'});
-
-  const lead = getLeadById(lead_id);
-  if(!lead) return res.status(404).json({ok:false,error:'Lead not found'});
-  const contacts = getContactsByLeadId(lead_id);
-  const contact = contact_id ? contacts.find(c=>c.id===Number(contact_id)) : contacts[0];
-
-  const notes = lead.notes||'';
-  const jobTitle = notes.match(/Job Title: (.+)/)?.[1]||'';
-  const jobDesc = notes.includes('Description: ') ? notes.split('Description: ')[1].split('\nSalary:')[0].split('\nPosted:')[0].trim() : '';
-  const salary = notes.match(/Salary: (.+)/)?.[1]||'';
-
-  const prompt = `Write a cold outreach email for ByteOn Technologies, an IT outsourcing company from India.
-
-TARGET:
-- Company: ${lead.company}
-- Contact: ${contact?.name||'there'}, ${contact?.role||'Decision Maker'}
-- Industry: ${lead.industry||'Technology'}
-- Location: ${lead.location||'USA'}
-${jobTitle?`- They posted a job for: ${jobTitle}`:''}
-${salary?`- Budget/salary mentioned: ${salary}`:''}
-${jobDesc?`- Job details: ${jobDesc.substring(0,200)}`:''}
-
-OUR SERVICES: Software Development (React, Node.js, Python, Java, Mobile), QA & Testing, DevOps & Cloud, IT Support, Data Engineering, Cybersecurity, Project Management.
-UNIQUE VALUE: Resources ready in 5-7 days, 40-60% cheaper than local hiring, pre-vetted professionals.
-
-EMAIL #${email_num} IN SEQUENCE:
-${email_num===1?'First contact — reference their job post, be specific, under 120 words':''}
-${email_num===2?'Follow-up day 3 — add value with a specific benefit or stat, under 80 words':''}
-${email_num===3?'Follow-up day 7 — different angle, very short, under 60 words':''}
-${email_num===4?'Final break-up email — day 14, creates urgency, under 50 words':''}
-
-RULES: No "I hope this email finds you well". Sound human. End with one clear question. Sign: Anas | ByteOn Technologies | byteonai.com
-
-Respond ONLY with valid JSON, no markdown:
-{"subject":"...","body":"..."}`;
+Respond ONLY with valid JSON, no markdown, no extra text: {"subject":"...","body":"..."}`;
 
   try{
     const r = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
       {contents:[{parts:[{text:prompt}]}]},
-      {headers:{'Content-Type':'application/json'},timeout:30000}
+      {headers:{'Content-Type':'application/json'},timeout:25000}
     );
-    const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'{}';
-    const clean = text.replace(/```json|```/g,'').trim();
+    const raw = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'{}';
+    const clean = raw.replace(/```json|```/g,'').trim();
     const parsed = JSON.parse(clean);
-    if(!parsed.subject||!parsed.body) throw new Error('Invalid response from Gemini');
+    if(!parsed.subject||!parsed.body) throw new Error('Gemini returned incomplete JSON');
     dbLog('🤖','Gemini email generated',`${lead.company} — email #${email_num}`);
     res.json({ok:true, subject:parsed.subject, body:parsed.body});
   }catch(e){
-    dbLog('❌','Gemini failed',e.message);
+    dbLog('❌','Gemini failed',e.response?.data?.error?.message||e.message);
     res.json({ok:false, error:e.response?.data?.error?.message||e.message});
-  }
-});
-
-// ── Gemini AI Email Generator ────────────────────────────────────────────
-app.post('/api/ai/generate-email',async(req,res)=>{
-  const {lead_id, contact_id, email_num=1} = req.body;
-  if(!lead_id) return res.status(400).json({ok:false,error:'lead_id required'});
-  const lead = getLeadById(lead_id);
-  const contacts = getContactsByLeadId(lead_id);
-  const contact = contact_id ? contacts.find(c=>c.id===Number(contact_id)) : contacts[0];
-  if(!lead) return res.status(404).json({ok:false,error:'Lead not found'});
-
-  const GEMINI_KEY = process.env.GEMINI_API_KEY;
-  if(!GEMINI_KEY) return res.json({ok:false,error:'GEMINI_API_KEY not set in Railway variables'});
-
-  const notes = lead.notes||'';
-  const jobTitle = notes.match(/Job Title: (.+)/)?.[1]||'';
-  const salary = notes.match(/Salary: (.+)/)?.[1]||'';
-  const jobDesc = notes.includes('Description: ') ? notes.split('Description: ')[1].split('\nSalary:')[0].split('\nPosted:')[0].trim() : '';
-
-  const seqLabels = {1:'initial outreach',2:'follow-up day 3',3:'follow-up day 7',4:'break-up day 14'};
-
-  const prompt = `Write a cold outreach email for an IT outsourcing company.
-
-SENDER: ByteOn Technologies — provides IT outsourcing: developers, QA, DevOps, cloud, IT support, data engineering, cybersecurity, project managers. Resources ready in 5-7 days, 40-60% cheaper than full-time hiring.
-
-TARGET COMPANY: ${lead.company}
-Contact: ${contact?.name||'Decision Maker'} (${contact?.role||'CTO/HR'})
-${jobTitle?'Job they posted: '+jobTitle:''}
-${salary?'Salary mentioned: '+salary:''}
-${jobDesc?'Job details: '+jobDesc.substring(0,200):''}
-Source: found via ${lead.source||'job board'}
-
-EMAIL TYPE: ${seqLabels[email_num]||'initial outreach'}
-${email_num===1?'Reference their specific job post. Show you understand their need.':''}
-${email_num===2?'Add value — mention a case study or stat. Do not just say following up.':''}
-${email_num===3?'New angle — talk about flexibility/speed. Keep it under 80 words.':''}
-${email_num===4?'Break-up email. Say you will stop reaching out after this. Creates urgency.':''}
-
-RULES: Under 120 words. No "I hope this email finds you well". One CTA (15-min call). Sign as Anas, ByteOn Technologies, byteonai.com
-
-Return ONLY valid JSON: {"subject":"...","body":"..."}`;
-
-  try{
-    const r = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
-      {contents:[{parts:[{text:prompt}]}]},
-      {headers:{'Content-Type':'application/json'},timeout:20000}
-    );
-    const text = r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'{}';
-    const clean = text.replace(/```json|```/g,'').trim();
-    const parsed = JSON.parse(clean);
-    dbLog('🤖','Gemini email generated',`${lead.company} — email #${email_num}`);
-    res.json({ok:true, subject:parsed.subject, body:parsed.body});
-  }catch(e){
-    dbLog('❌','Gemini failed',e.message);
-    res.json({ok:false,error:e.response?.data?.error?.message||e.message});
   }
 });
 
@@ -1022,14 +863,41 @@ app.post('/api/agent/run',async(req,res)=>{const d=req.body?.dry_run===true;runA
 app.post('/api/agent/check-replies',async(req,res)=>res.json({ok:true,replies_found:await checkForReplies()}));
 app.get('/api/test/gmail',async(req,res)=>res.json(await testSmtp()));
 
-// Hunter.io test
+// Hunter.io test — shows exact credits remaining
 app.get('/api/test/hunter',async(req,res)=>{
   const key=process.env.HUNTER_API_KEY;
-  if(!key) return res.json({ok:false,error:'HUNTER_API_KEY not set'});
+  if(!key) return res.json({ok:false,error:'HUNTER_API_KEY not set in Railway'});
   try{
     const r=await axios.get('https://api.hunter.io/v2/account',{params:{api_key:key},timeout:10000});
-    res.json({ok:true,plan:r.data?.data?.plan_name,searches_left:r.data?.data?.requests?.searches?.available});
+    const data = r.data?.data;
+    const searches = data?.requests?.searches;
+    res.json({
+      ok:true,
+      plan: data?.plan_name||'unknown',
+      searches_used: searches?.used||0,
+      searches_available: searches?.available||0,
+      resets: 'Monthly',
+      warning: (searches?.available||0)<5 ? '⚠️ Almost out of Hunter credits! Will stop finding emails.' : null
+    });
   }catch(e){res.json({ok:false,error:e.response?.data?.errors?.[0]?.details||e.message});}
+});
+
+// Gemini test — verifies API key and generates a sample email
+app.get('/api/test/gemini',async(req,res)=>{
+  const key=process.env.GEMINI_API_KEY;
+  if(!key) return res.json({ok:false,error:'GEMINI_API_KEY not set in Railway'});
+  try{
+    const r=await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+      {contents:[{parts:[{text:'Write a 2-sentence cold email subject line for an IT outsourcing company called ByteOn Technologies reaching out to Stripe who is hiring a remote React developer. Respond ONLY with JSON: {"subject":"...","body":"..."}'}]}]},
+      {headers:{'Content-Type':'application/json'},timeout:20000}
+    );
+    const raw=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'{}';
+    const parsed=JSON.parse(raw.replace(/```json|```/g,'').trim());
+    res.json({ok:true, message:'Gemini working!', model:'gemini-2.0-flash', sample_subject:parsed.subject, sample_body:parsed.body});
+  }catch(e){
+    res.json({ok:false, error:e.response?.data?.error?.message||e.message});
+  }
 });
 
 // CSV upload endpoint
