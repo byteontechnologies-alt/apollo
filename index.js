@@ -773,13 +773,9 @@ app.post('/api/ai/generate-email',async(req,res)=>{
   const contact = contact_id ? contacts.find(c=>c.id===Number(contact_id)) : contacts[0];
 
   const notes = lead.notes||'';
-  const jobTitle = notes.includes('Job Title: ') ? notes.split('Job Title: ')[1].split('
-')[0] : '';
-  const jobDesc = notes.includes('Description: ') ? notes.split('Description: ')[1].split('
-Salary:')[0].split('
-Posted:')[0].trim() : '';
-  const salary = notes.includes('Salary: ') ? notes.split('Salary: ')[1].split('
-')[0] : '';
+  const jobTitle = notes.match(/Job Title: (.+)/)?.[1]||'';
+  const jobDesc = notes.includes('Description: ') ? notes.split('Description: ')[1].split('\nSalary:')[0].split('\nPosted:')[0].trim() : '';
+  const salary = notes.match(/Salary: (.+)/)?.[1]||'';
 
   const prompt = `Write a cold outreach email for ByteOn Technologies, an IT outsourcing company from India.
 
@@ -839,9 +835,7 @@ app.post('/api/ai/generate-email',async(req,res)=>{
   const notes = lead.notes||'';
   const jobTitle = notes.match(/Job Title: (.+)/)?.[1]||'';
   const salary = notes.match(/Salary: (.+)/)?.[1]||'';
-  const jobDesc = notes.includes('Description: ') ? notes.split('Description: ')[1].split('
-Salary:')[0].split('
-Posted:')[0].trim() : '';
+  const jobDesc = notes.includes('Description: ') ? notes.split('Description: ')[1].split('\nSalary:')[0].split('\nPosted:')[0].trim() : '';
 
   const seqLabels = {1:'initial outreach',2:'follow-up day 3',3:'follow-up day 7',4:'break-up day 14'};
 
@@ -858,9 +852,9 @@ Source: found via ${lead.source||'job board'}
 
 EMAIL TYPE: ${seqLabels[email_num]||'initial outreach'}
 ${email_num===1?'Reference their specific job post. Show you understand their need.':''}
-${email_num===2?'Add value — mention a case study or stat. Don't just say "following up".':''}
+${email_num===2?'Add value — mention a case study or stat. Do not just say following up.':''}
 ${email_num===3?'New angle — talk about flexibility/speed. Keep it under 80 words.':''}
-${email_num===4?'Break-up email. "I'll stop reaching out after this." Creates urgency.':''}
+${email_num===4?'Break-up email. Say you will stop reaching out after this. Creates urgency.':''}
 
 RULES: Under 120 words. No "I hope this email finds you well". One CTA (15-min call). Sign as Anas, ByteOn Technologies, byteonai.com
 
