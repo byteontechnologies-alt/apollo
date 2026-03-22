@@ -396,17 +396,9 @@ async function scrapeYC(){
   return results;
 }
 
-// ── 4. RemoteOK API (free public API — no blocking) ──────────────────────
+// ── 4. RemoteOK (JSON API with fallback to RSS) ───────────────────────────
 async function scrapeRemoteOK(){
   const results = [];
-  try{
-    const r = await axios.get('https://remoteok.com/api',{
-      headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'},
-      timeout:20000
-    });
-    const jobs = Array.isArray(r.data)?r.data.filter(j=>j.company):[];
-    // RemoteOK is already 100% remote — perfect for us
-  // Filter: all IT services, $20+/hr
   const keywords = [
     'react','node','python','javascript','typescript',
     'devops','backend','fullstack','frontend','mobile',
@@ -415,26 +407,72 @@ async function scrapeRemoteOK(){
     'cybersecurity','project-manager','scrum',
     'it-support','managed-services','staff-augmentation',
   ];
+
+  // Try JSON API first
+  try{
+    const r = await axios.get('https://remoteok.com/api',{
+      headers:{
+        'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept':'application/json, text/plain, */*',
+        'Accept-Language':'en-US,en;q=0.9',
+        'Referer':'https://remoteok.com/',
+      },
+      timeout:20000
+    });
+    const jobs = Array.isArray(r.data)?r.data.filter(j=>j.company):[];
     for(const job of jobs.slice(0,100)){
-      const text = `${job.position||''} ${job.tags?.join(' ')||''}`.toLowerCase();
+      const text = `${job.position||''} ${(job.tags||[]).join(' ')}`.toLowerCase();
       const relevant = keywords.some(k=>text.includes(k));
       if(relevant && job.company){
         results.push({
           company: job.company,
-          website: job.url||null,
+          website: job.company_website||null,
           source: 'remoteok',
           location: 'Remote / USA',
           job_title: job.position||'Developer',
           job_url: `https://remoteok.com/l/${job.slug||''}`,
           job_desc: job.description?job.description.replace(/<[^>]+>/g,'').substring(0,300):'',
           salary: job.salary||'',
-          date_posted: job.date||'',
           notes:`RemoteOK: hiring ${job.position||'developer'}${job.salary?' · '+job.salary:''}`
         });
       }
     }
-    dbLog('🌍','RemoteOK',`${results.length} companies found`);
-  }catch(e){ dbLog('⚠️','RemoteOK error',e.message); }
+    dbLog('🌍','RemoteOK JSON',`${results.length} companies found`);
+    return results;
+  }catch(e){
+    dbLog('⚠️','RemoteOK JSON failed',`${e.response?.status||e.message} — trying RSS fallback`);
+  }
+
+  // Fallback: RemoteOK RSS feed (no auth, rarely blocked)
+  try{
+    const rssFeeds = [
+      'https://remoteok.com/remote-dev-jobs.rss',
+      'https://remoteok.com/remote-javascript-jobs.rss',
+      'https://remoteok.com/remote-python-jobs.rss',
+      'https://remoteok.com/remote-devops-jobs.rss',
+    ];
+    for(const feedUrl of rssFeeds){
+      try{
+        const r = await axios.get(feedUrl,{
+          headers:{'User-Agent':'Mozilla/5.0 (compatible; RSS/2.0)','Accept':'application/rss+xml,text/xml'},
+          timeout:15000
+        });
+        const items = r.data.split('<item>').slice(1);
+        for(const item of items.slice(0,15)){
+          const title   = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/s)||item.match(/<title>(.*?)<\/title>/s)||[])[1]||'';
+          const link    = (item.match(/<link>(.*?)<\/link>/s)||[])[1]||'';
+          const creator = (item.match(/<dc:creator><!\[CDATA\[(.*?)\]\]><\/dc:creator>/s)||[])[1]||'';
+          const company = creator || (title.match(/ at (.+)$/)?.[1]||'').trim();
+          if(company && company.length>1 && company.length<60){
+            results.push({company, source:'remoteok', location:'Remote / USA', job_url:link, notes:`RemoteOK RSS: ${title.substring(0,80)}`});
+          }
+        }
+        await new Promise(r=>setTimeout(r,800));
+      }catch(e){}
+    }
+    dbLog('🌍','RemoteOK RSS fallback',`${results.length} companies found`);
+  }catch(e){ dbLog('⚠️','RemoteOK RSS also failed',e.message); }
+
   return results;
 }
 
@@ -593,32 +631,39 @@ async function scrapeGoogleCustom(){
       }));
 
       for(const item of items){
-        if(results.length >= remainingSlots) break; // per-item cap check
+        if(results.length >= remainingSlots) break;
 
         const title = item.title||'';
         const link  = item.link||'';
         const desc  = item.snippet||'';
         const text  = (title+' '+desc).toLowerCase();
 
-        // ── REMOTE ONLY FILTER — skip anything not clearly remote ──────
-        const isRemote = /\bremote\b/.test(text);
-        const isOnsite = /\bon.?site\b|\bin.?office\b|\bon.?location\b|\bin.person\b/.test(text);
-        if(!isRemote || isOnsite) continue; // must say "remote" AND not say "on-site"
+        // Skip hard on-site signals only (don't require "remote" in snippet —
+        // the query already contains "remote" so Google pre-filtered for us)
+        const isOnsite = /\bon.?site\b|\bin.?office\b|\bin.?person\b|\bhybrid\b/.test(text);
+        if(isOnsite) continue;
 
-        // Skip if salary is below $20/hr (when salary is mentioned)
+        // Skip if salary explicitly mentioned AND below $20/hr
         const salaryNums = (title+' '+desc).match(/\$(\d+)(?:\/hr|\/hour| per hour)/gi)||[];
         const salaryValues = salaryNums.map(s=>parseInt(s.replace(/\D/g,'')));
         const maxSalary = salaryValues.length>0 ? Math.max(...salaryValues) : null;
         if(maxSalary !== null && maxSalary < 20) continue;
 
-        // Extract company name
+        // Extract company name — multiple strategies
         let company = '';
         const m1 = title.match(/ at ([A-Z][A-Za-z0-9 &,.]+?)(?:\s*[-|])/);
-        const m2 = title.match(/^([A-Z][A-Za-z0-9 &]+?) [-] /);
+        const m2 = title.match(/^([A-Z][A-Za-z0-9 &]+?) [-–|] /);
         const m3 = desc.match(/([A-Z][A-Za-z0-9 &]+?) is (?:looking|hiring|seeking|need)/);
         const m4 = desc.match(/([A-Z][A-Za-z0-9 &]+?) (?:company|startup|inc|llc|corp)/i);
+        // Fallback: extract domain name from URL as company hint
+        const domainMatch = link.match(/https?:\/\/(?:www\.)?([^\/]+)/);
+        const domainHint = domainMatch ? domainMatch[1].split('.')[0] : '';
         company = (m1&&m1[1])||(m2&&m2[1])||(m3&&m3[1])||(m4&&m4[1])||'';
         company = company.trim().replace(/\.$/, '');
+        // Use domain as company if extraction failed and domain looks like a company
+        if(!company && domainHint && domainHint.length>2 && !['www','jobs','careers','linkedin','indeed','glassdoor','ziprecruiter','google'].includes(domainHint)){
+          company = domainHint.charAt(0).toUpperCase()+domainHint.slice(1);
+        }
 
         if(company && company.length>2 && company.length<60){
           const salaryMatch = (title+' '+desc).match(/\$[\d,]+(?:\s*-\s*\$[\d,]+)?(?:\/hr|\/hour|k| per hour)?/i);
@@ -639,6 +684,7 @@ async function scrapeGoogleCustom(){
           results.push({
             company, source:'serper',
             job_url: link,
+            website: link,
             job_title: `${serviceLabel} — ${title.substring(0,60)}`,
             job_desc: desc.substring(0,250),
             salary, location:'Remote / USA',
