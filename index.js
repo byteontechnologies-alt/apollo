@@ -122,17 +122,59 @@ async function findEmailsByDomain(domain){
   } catch(e) { return []; }
 }
 async function enrichContactsWithHunter(){
+  const key = process.env.HUNTER_API_KEY;
+  if(!key){ dbLog('⚠️','Hunter skipped','HUNTER_API_KEY not set'); return 0; }
+
   const contacts = db.get('contacts').filter(c=>!c.email).value();
   let found = 0;
+  let searched = 0;
+  const HUNTER_DAILY_LIMIT = 20; // stay well within free 25/month
+
   for(const c of contacts){
+    if(searched >= HUNTER_DAILY_LIMIT) break;
     const lead = getLeadById(c.lead_id);
-    if(!lead?.website) continue;
-    const domain = lead.website.replace(/^https?:\/\//,'').replace(/\/.*/,'');
-    const nameParts = c.name.split(' ');
-    const email = await findEmailHunter(nameParts[0], nameParts[1]||'', domain);
-    if(email){ updateContactEmail(c.id, email); found++; dbLog('🔍','Email found via Hunter',`${c.name} → ${email}`); }
-    await new Promise(r=>setTimeout(r,1000));
+    if(!lead) continue;
+
+    // Get domain — from website field or guess from company name
+    let domain = '';
+    if(lead.website){
+      domain = lead.website.replace(/^https?:\/\//,'').replace(/\/.*/,'').replace(/^www\./,'');
+    } else {
+      // Guess domain: "Stripe Inc" → "stripe.com"
+      domain = lead.company.toLowerCase()
+        .replace(/[^a-z0-9 ]/g,'').replace(/\s+(inc|llc|corp|ltd|co|technologies|tech|solutions|services|group)$/,'')
+        .trim().replace(/\s+/g,'')+'.com';
+    }
+    if(!domain) continue;
+
+    searched++;
+    const nameParts = (c.name||'').split(' ');
+    const firstName = c.first_name||nameParts[0]||'';
+    const lastName  = nameParts[1]||'';
+
+    // Try 1: find specific person's email
+    let email = await findEmailHunter(firstName, lastName, domain);
+
+    // Try 2: if person not found, grab any email from the domain
+    if(!email && lead.website){
+      const domainEmails = await findEmailsByDomain(domain);
+      if(domainEmails.length>0){
+        email = domainEmails[0].value; // use first email found on domain
+        dbLog('🔍','Hunter domain fallback',`${lead.company} → ${email}`);
+      }
+    }
+
+    if(email){
+      updateContactEmail(c.id, email);
+      found++;
+      dbLog('🎯','Hunter email found',`${c.name} at ${lead.company} → ${email}`);
+    } else {
+      dbLog('🔍','Hunter no result',`${lead.company} (${domain})`);
+    }
+    await new Promise(r=>setTimeout(r,1200));
   }
+
+  dbLog('🔍','Hunter enrichment done',`${found} emails found from ${searched} searches`);
   return found;
 }
 
@@ -971,22 +1013,22 @@ app.get('/api/test/google',async(req,res)=>{
   if(!key) return res.json({ok:false,error:'SERPER_API_KEY not set in Railway'});
   try{
     const r = await axios.post('https://google.serper.dev/search',
-      { q:'React developer hiring USA', num:3, gl:'us' },
+      { q:'remote React developer contract hiring USA', num:5, gl:'us' },
       { headers:{ 'X-API-KEY': key, 'Content-Type':'application/json' }, timeout:15000 }
     );
     const items = r.data?.organic||[];
     res.json({
       ok:true,
-      message:`Serper Search working! Found ${items.length} results`,
-      credits_used: r.data?.credits||'N/A',
-      sample: items.slice(0,2).map(i=>({title:i.title,link:i.link}))
+      message:`Serper working! Found ${items.length} results. NOTE: this used 1 credit.`,
+      credits_remaining: r.data?.credits||'check serper.dev dashboard',
+      sample: items.slice(0,3).map(i=>({title:i.title,link:i.link,snippet:i.snippet?.substring(0,100)}))
     });
   }catch(e){
     res.json({ok:false,error:e.response?.data?.message||e.message, details:e.response?.data});
   }
 });
 app.post('/api/scrape/indeed',async(req,res)=>{try{const r=await scrapeIndeed();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
-app.post('/api/scrape/google',async(req,res)=>{try{const r=await scrapeGoogle();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
+app.post('/api/scrape/google',async(req,res)=>{try{const r=await scrapeGoogleCustom();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
 app.post('/api/scrape/yc',async(req,res)=>{try{const r=await scrapeYC();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
 app.post('/api/hunter/enrich',async(req,res)=>{
   try{const found=await enrichContactsWithHunter();res.json({ok:true,emails_found:found});}
