@@ -451,6 +451,7 @@ function markSerperFiredToday(){
   const rec = db.get('_serperDaily').value()||{};
   db.set('_serperDaily',{...rec, date:today, fired:true}).write();
 }
+function getSerperDailyCount(){
   const today = new Date().toISOString().slice(0,10); // YYYY-MM-DD
   const rec = db.get('_serperDaily').value();
   if(!rec||rec.date!==today) return 0;
