@@ -4,7 +4,9 @@ const{createClient}=require('@libsql/client');
 
 // ── Turso Database (persistent cloud SQLite — survives Railway redeploys) ─
 if(!process.env.TURSO_URL||!process.env.TURSO_TOKEN){console.error('❌ TURSO_URL or TURSO_TOKEN missing from Railway variables!');process.exit(1);}
-const db=createClient({url:process.env.TURSO_URL,authToken:process.env.TURSO_TOKEN});
+// Convert libsql:// to https:// to bypass Turso migration system (not needed on free plan)
+const tursoUrl = process.env.TURSO_URL.replace(/^libsql:\/\//,'https://');
+const db=createClient({url:tursoUrl,authToken:process.env.TURSO_TOKEN});
 
 async function initDB(){
   await db.execute(`CREATE TABLE IF NOT EXISTS leads(id INTEGER PRIMARY KEY AUTOINCREMENT,company TEXT,website TEXT,industry TEXT,size TEXT,location TEXT,source TEXT DEFAULT 'manual',notes TEXT,status TEXT DEFAULT 'new',created_at TEXT,updated_at TEXT)`);
