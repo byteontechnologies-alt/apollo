@@ -7,13 +7,11 @@ if(!process.env.TURSO_URL||!process.env.TURSO_TOKEN){console.error('❌ TURSO_UR
 const db=createClient({url:process.env.TURSO_URL,authToken:process.env.TURSO_TOKEN});
 
 async function initDB(){
-  await db.executeMultiple(`
-    CREATE TABLE IF NOT EXISTS leads(id INTEGER PRIMARY KEY AUTOINCREMENT,company TEXT,website TEXT,industry TEXT,size TEXT,location TEXT,source TEXT DEFAULT 'manual',notes TEXT,status TEXT DEFAULT 'new',created_at TEXT,updated_at TEXT);
-    CREATE TABLE IF NOT EXISTS contacts(id INTEGER PRIMARY KEY AUTOINCREMENT,lead_id INTEGER,name TEXT DEFAULT 'Unknown',first_name TEXT DEFAULT 'there',role TEXT,email TEXT,linkedin TEXT,status TEXT DEFAULT 'new',emails_sent INTEGER DEFAULT 0,last_sent TEXT,replied_at TEXT,created_at TEXT);
-    CREATE TABLE IF NOT EXISTS emails(id INTEGER PRIMARY KEY AUTOINCREMENT,contact_id INTEGER,lead_id INTEGER,direction TEXT,subject TEXT,body TEXT,from_addr TEXT,to_addr TEXT,template_num INTEGER,message_id TEXT,sent_at TEXT);
-    CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY AUTOINCREMENT,icon TEXT,title TEXT,detail TEXT,created_at TEXT);
-    CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value TEXT);
-  `);
+  await db.execute(`CREATE TABLE IF NOT EXISTS leads(id INTEGER PRIMARY KEY AUTOINCREMENT,company TEXT,website TEXT,industry TEXT,size TEXT,location TEXT,source TEXT DEFAULT 'manual',notes TEXT,status TEXT DEFAULT 'new',created_at TEXT,updated_at TEXT)`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS contacts(id INTEGER PRIMARY KEY AUTOINCREMENT,lead_id INTEGER,name TEXT DEFAULT 'Unknown',first_name TEXT DEFAULT 'there',role TEXT,email TEXT,linkedin TEXT,status TEXT DEFAULT 'new',emails_sent INTEGER DEFAULT 0,last_sent TEXT,replied_at TEXT,created_at TEXT)`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS emails(id INTEGER PRIMARY KEY AUTOINCREMENT,contact_id INTEGER,lead_id INTEGER,direction TEXT,subject TEXT,body TEXT,from_addr TEXT,to_addr TEXT,template_num INTEGER,message_id TEXT,sent_at TEXT)`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY AUTOINCREMENT,icon TEXT,title TEXT,detail TEXT,created_at TEXT)`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value TEXT)`);
   console.log('✅ Turso DB connected and ready');
 }
 
