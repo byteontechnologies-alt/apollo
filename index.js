@@ -1,28 +1,84 @@
 require('dotenv').config();
-const express=require('express'),cors=require('cors'),axios=require('axios'),nodemailer=require('nodemailer'),Imap=require('imap'),{simpleParser}=require('mailparser'),cron=require('node-cron'),path=require('path'),fs=require('fs'),low=require('lowdb'),FileSync=require('lowdb/adapters/FileSync'),multer=require('multer'),csvParser=require('csv-parser');
+const express=require('express'),cors=require('cors'),axios=require('axios'),nodemailer=require('nodemailer'),Imap=require('imap'),{simpleParser}=require('mailparser'),cron=require('node-cron'),path=require('path'),fs=require('fs'),multer=require('multer'),csvParser=require('csv-parser');
+const{createClient}=require('@libsql/client');
 
-// ── Database ──────────────────────────────────────────────────────────────
-const DATA_DIR=path.join(__dirname,'data');
-if(!fs.existsSync(DATA_DIR))fs.mkdirSync(DATA_DIR,{recursive:true});
-const db=low(new FileSync(path.join(DATA_DIR,'leadforge.json')));
-db.defaults({leads:[],contacts:[],emails:[],activity_log:[],_nextId:{leads:1,contacts:1,emails:1,activity_log:1},_serperDaily:{date:'',count:0}}).write();
-function nextId(t){const id=db.get(`_nextId.${t}`).value();db.set(`_nextId.${t}`,id+1).write();return id;}
-function getAllLeads(){return db.get('leads').value().map(l=>{const c=db.get('contacts').filter({lead_id:l.id}).value();return{...l,contact_count:c.length,total_sent:c.reduce((a,x)=>a+(x.emails_sent||0),0),has_reply:c.some(x=>x.status==='replied')?1:0};}).reverse();}
-function getLeadById(id){return db.get('leads').find({id:Number(id)}).value();}
-function insertLead(d){const id=nextId('leads');db.get('leads').push({id,company:d.company||'',website:d.website||null,industry:d.industry||null,size:d.size||null,location:d.location||null,source:d.source||'manual',notes:d.notes||null,status:'new',created_at:new Date().toISOString(),updated_at:new Date().toISOString()}).write();return{lastInsertRowid:id};}
-function getContactsByLeadId(lid){return db.get('contacts').filter({lead_id:Number(lid)}).value();}
-function getContactById(id){return db.get('contacts').find({id:Number(id)}).value();}
-function insertContact(d){const id=nextId('contacts');db.get('contacts').push({id,lead_id:Number(d.lead_id),name:d.name||'Unknown',first_name:d.first_name||'there',role:d.role||'',email:d.email||null,linkedin:d.linkedin||null,status:'new',emails_sent:0,last_sent:null,replied_at:null,created_at:new Date().toISOString()}).write();return{lastInsertRowid:id};}
-function updateContactEmail(id,email){db.get('contacts').find({id:Number(id)}).assign({email}).write();}
-function markContactSent(id){const c=db.get('contacts').find({id:Number(id)}).value();if(!c)return;db.get('contacts').find({id:Number(id)}).assign({emails_sent:(c.emails_sent||0)+1,last_sent:new Date().toISOString(),status:c.status==='new'?'sent':'followup'}).write();}
-function markContactReplied(id){db.get('contacts').find({id:Number(id)}).assign({status:'replied',replied_at:new Date().toISOString()}).write();}
-function getContactsDueForFollowup(){const days=(process.env.FOLLOWUP_DAYS||'3,7,14').split(',').map(Number),min=Math.min(...days);return db.get('contacts').filter(c=>['sent','followup'].includes(c.status)&&c.email&&c.last_sent&&c.emails_sent<days.length+1&&(Date.now()-new Date(c.last_sent).getTime())/86400000>=min).value().map(c=>{const l=getLeadById(c.lead_id);return{...c,company:l?l.company:''};});}
-function getContactsNotYetEmailed(){return db.get('contacts').filter(c=>c.status==='new'&&c.email).value().slice(0,parseInt(process.env.MAX_EMAILS_PER_DAY)||30).map(c=>{const l=getLeadById(c.lead_id);return{...c,company:l?l.company:''};});}
-function getEmailsByLeadId(lid){return db.get('emails').filter({lead_id:Number(lid)}).value().map(e=>{const c=getContactById(e.contact_id);return{...e,contact_name:c?c.name:'',contact_role:c?c.role:''};});}
-function insertEmail(d){const id=nextId('emails');db.get('emails').push({id,contact_id:Number(d.contact_id),lead_id:Number(d.lead_id),direction:d.direction,subject:d.subject||'',body:d.body||'',from_addr:d.from_addr||'',to_addr:d.to_addr||'',template_num:d.template_num||null,message_id:d.message_id||null,sent_at:new Date().toISOString()}).write();return{lastInsertRowid:id};}
-function dbLog(icon,title,detail){console.log(`[${icon}] ${title}${detail?' — '+detail:''}`);const id=nextId('activity_log');db.get('activity_log').push({id,icon,title,detail:detail||'',created_at:new Date().toISOString()}).write();}
-function getRecentActivity(limit=50){return db.get('activity_log').value().slice(-limit).reverse();}
-function getStats(){const l=db.get('leads').value(),c=db.get('contacts').value(),e=db.get('emails').value();return{total_leads:l.length,total_contacts:c.length,emails_found:c.filter(x=>x.email).length,contacted:c.filter(x=>x.emails_sent>0).length,total_sent:c.reduce((a,x)=>a+(x.emails_sent||0),0),followups_due:c.filter(x=>x.status==='followup').length,total_replies:c.filter(x=>x.status==='replied').length,emails_out:e.filter(x=>x.direction==='out').length};}
+// ── Turso Database (persistent cloud SQLite — survives Railway redeploys) ─
+if(!process.env.TURSO_URL||!process.env.TURSO_TOKEN){console.error('❌ TURSO_URL or TURSO_TOKEN missing from Railway variables!');process.exit(1);}
+const db=createClient({url:process.env.TURSO_URL,authToken:process.env.TURSO_TOKEN});
+
+async function initDB(){
+  await db.executeMultiple(`
+    CREATE TABLE IF NOT EXISTS leads(id INTEGER PRIMARY KEY AUTOINCREMENT,company TEXT,website TEXT,industry TEXT,size TEXT,location TEXT,source TEXT DEFAULT 'manual',notes TEXT,status TEXT DEFAULT 'new',created_at TEXT,updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS contacts(id INTEGER PRIMARY KEY AUTOINCREMENT,lead_id INTEGER,name TEXT DEFAULT 'Unknown',first_name TEXT DEFAULT 'there',role TEXT,email TEXT,linkedin TEXT,status TEXT DEFAULT 'new',emails_sent INTEGER DEFAULT 0,last_sent TEXT,replied_at TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS emails(id INTEGER PRIMARY KEY AUTOINCREMENT,contact_id INTEGER,lead_id INTEGER,direction TEXT,subject TEXT,body TEXT,from_addr TEXT,to_addr TEXT,template_num INTEGER,message_id TEXT,sent_at TEXT);
+    CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY AUTOINCREMENT,icon TEXT,title TEXT,detail TEXT,created_at TEXT);
+    CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY,value TEXT);
+  `);
+  console.log('✅ Turso DB connected and ready');
+}
+
+// ── KV helpers (for Serper daily tracking) ───────────────────────────────
+async function kvGet(key){try{const r=await db.execute({sql:'SELECT value FROM kv WHERE key=?',args:[key]});return r.rows[0]?JSON.parse(r.rows[0].value):null;}catch(e){return null;}}
+async function kvSet(key,val){await db.execute({sql:'INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)',args:[key,JSON.stringify(val)]});}
+
+// ── DB functions (all async now) ─────────────────────────────────────────
+async function getAllLeads(){
+  const[leads,contacts]=await Promise.all([
+    db.execute('SELECT * FROM leads ORDER BY id DESC'),
+    db.execute('SELECT lead_id,status,emails_sent FROM contacts')
+  ]);
+  return leads.rows.map(l=>{
+    const cs=contacts.rows.filter(c=>Number(c.lead_id)===Number(l.id));
+    return{...l,id:Number(l.id),contact_count:cs.length,total_sent:cs.reduce((a,x)=>a+(Number(x.emails_sent)||0),0),has_reply:cs.some(x=>x.status==='replied')?1:0};
+  });
+}
+async function getLeadById(id){const r=await db.execute({sql:'SELECT * FROM leads WHERE id=?',args:[Number(id)]});const l=r.rows[0];return l?{...l,id:Number(l.id)}:null;}
+async function insertLead(d){const r=await db.execute({sql:'INSERT INTO leads(company,website,industry,size,location,source,notes,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',args:[d.company||'',d.website||null,d.industry||null,d.size||null,d.location||null,d.source||'manual',d.notes||null,'new',new Date().toISOString(),new Date().toISOString()]});return{lastInsertRowid:Number(r.lastInsertRowid)};}
+async function getContactsByLeadId(lid){const r=await db.execute({sql:'SELECT * FROM contacts WHERE lead_id=?',args:[Number(lid)]});return r.rows.map(c=>({...c,id:Number(c.id),lead_id:Number(c.lead_id),emails_sent:Number(c.emails_sent)||0}));}
+async function getContactById(id){const r=await db.execute({sql:'SELECT * FROM contacts WHERE id=?',args:[Number(id)]});const c=r.rows[0];return c?{...c,id:Number(c.id),lead_id:Number(c.lead_id),emails_sent:Number(c.emails_sent)||0}:null;}
+async function insertContact(d){const r=await db.execute({sql:'INSERT INTO contacts(lead_id,name,first_name,role,email,linkedin,status,emails_sent,created_at) VALUES(?,?,?,?,?,?,?,?,?)',args:[Number(d.lead_id),d.name||'Unknown',d.first_name||'there',d.role||'',d.email||null,d.linkedin||null,'new',0,new Date().toISOString()]});return{lastInsertRowid:Number(r.lastInsertRowid)};}
+async function updateContactEmail(id,email){await db.execute({sql:'UPDATE contacts SET email=? WHERE id=?',args:[email,Number(id)]});}
+async function markContactSent(id){await db.execute({sql:"UPDATE contacts SET emails_sent=emails_sent+1,last_sent=?,status=CASE WHEN status='new' THEN 'sent' ELSE 'followup' END WHERE id=?",args:[new Date().toISOString(),Number(id)]});}
+async function markContactReplied(id){await db.execute({sql:"UPDATE contacts SET status='replied',replied_at=? WHERE id=?",args:[new Date().toISOString(),Number(id)]});}
+async function getContactsDueForFollowup(){
+  const days=(process.env.FOLLOWUP_DAYS||'3,7,14').split(',').map(Number),min=Math.min(...days);
+  const r=await db.execute("SELECT c.*,l.company FROM contacts c JOIN leads l ON l.id=c.lead_id WHERE c.status IN('sent','followup') AND c.email IS NOT NULL AND c.last_sent IS NOT NULL");
+  return r.rows.filter(c=>Number(c.emails_sent)<days.length+1&&(Date.now()-new Date(c.last_sent).getTime())/86400000>=min).map(c=>({...c,id:Number(c.id),lead_id:Number(c.lead_id),emails_sent:Number(c.emails_sent)||0}));
+}
+async function getContactsNotYetEmailed(){
+  const max=parseInt(process.env.MAX_EMAILS_PER_DAY)||30;
+  const r=await db.execute({sql:"SELECT c.*,l.company FROM contacts c JOIN leads l ON l.id=c.lead_id WHERE c.status='new' AND c.email IS NOT NULL LIMIT ?",args:[max]});
+  return r.rows.map(c=>({...c,id:Number(c.id),lead_id:Number(c.lead_id),emails_sent:Number(c.emails_sent)||0}));
+}
+async function getEmailsByLeadId(lid){
+  const r=await db.execute({sql:'SELECT e.*,c.name as contact_name,c.role as contact_role FROM emails e LEFT JOIN contacts c ON c.id=e.contact_id WHERE e.lead_id=?',args:[Number(lid)]});
+  return r.rows.map(e=>({...e,id:Number(e.id)}));
+}
+async function insertEmail(d){await db.execute({sql:'INSERT INTO emails(contact_id,lead_id,direction,subject,body,from_addr,to_addr,template_num,message_id,sent_at) VALUES(?,?,?,?,?,?,?,?,?,?)',args:[Number(d.contact_id),Number(d.lead_id),d.direction,d.subject||'',d.body||'',d.from_addr||'',d.to_addr||'',d.template_num||null,d.message_id||null,new Date().toISOString()]});}
+async function dbLog(icon,title,detail){console.log(`[${icon}] ${title}${detail?' — '+detail:''}`);try{await db.execute({sql:'INSERT INTO activity_log(icon,title,detail,created_at) VALUES(?,?,?,?)',args:[icon,title,detail||'',new Date().toISOString()]});}catch(e){}}
+async function getRecentActivity(limit=50){const r=await db.execute({sql:'SELECT * FROM activity_log ORDER BY id DESC LIMIT ?',args:[limit]});return r.rows;}
+async function getStats(){
+  const[l,c,ef,ct,ts,fu,tr,eo]=await Promise.all([
+    db.execute('SELECT COUNT(*) as n FROM leads'),
+    db.execute('SELECT COUNT(*) as n FROM contacts'),
+    db.execute('SELECT COUNT(*) as n FROM contacts WHERE email IS NOT NULL'),
+    db.execute('SELECT COUNT(*) as n FROM contacts WHERE emails_sent>0'),
+    db.execute('SELECT COALESCE(SUM(emails_sent),0) as n FROM contacts'),
+    db.execute("SELECT COUNT(*) as n FROM contacts WHERE status='followup'"),
+    db.execute("SELECT COUNT(*) as n FROM contacts WHERE status='replied'"),
+    db.execute("SELECT COUNT(*) as n FROM emails WHERE direction='out'"),
+  ]);
+  return{total_leads:Number(l.rows[0].n),total_contacts:Number(c.rows[0].n),emails_found:Number(ef.rows[0].n),contacted:Number(ct.rows[0].n),total_sent:Number(ts.rows[0].n),followups_due:Number(fu.rows[0].n),total_replies:Number(tr.rows[0].n),emails_out:Number(eo.rows[0].n)};
+}
+async function leadExists(company){const r=await db.execute({sql:'SELECT id FROM leads WHERE LOWER(TRIM(company))=LOWER(TRIM(?))',args:[company]});return r.rows.length>0;}
+
+// ── Serper daily guard (stored in Turso kv table) ─────────────────────────
+const SERPER_MAX_LEADS_PER_DAY=parseInt(process.env.SERPER_MAX_LEADS_DAY)||50;
+const SERPER_QUERIES_PER_RUN=1;
+async function serperFiredToday(){const rec=await kvGet('serperDaily');const today=new Date().toISOString().slice(0,10);return rec&&rec.date===today&&rec.fired===true;}
+async function markSerperFiredToday(){const today=new Date().toISOString().slice(0,10);const rec=(await kvGet('serperDaily'))||{};await kvSet('serperDaily',{...rec,date:today,fired:true});}
+async function getSerperDailyCount(){const rec=await kvGet('serperDaily');const today=new Date().toISOString().slice(0,10);return(rec&&rec.date===today)?rec.count||0:0;}
+async function addSerperDailyCount(n){const today=new Date().toISOString().slice(0,10);const rec=(await kvGet('serperDaily'))||{};await kvSet('serperDaily',{...rec,date:today,count:(rec.count||0)+n});}
 
 // ── Email templates ───────────────────────────────────────────────────────
 const TPLS={
@@ -50,10 +106,10 @@ function makeTransport(){
 async function testSmtp(){
   try{
     await makeTransport().verify();
-    dbLog('✅','Hostinger SMTP connected',process.env.SMTP_USER);
+    await dbLog('✅','Hostinger SMTP connected',process.env.SMTP_USER);
     return{ok:true, email:process.env.SMTP_USER};
   }catch(e){
-    dbLog('❌','Hostinger SMTP failed',e.message);
+    await dbLog('❌','Hostinger SMTP failed',e.message);
     return{ok:false,error:e.message};
   }
 }
@@ -68,7 +124,7 @@ async function sendEmail({contact,lead,emailNum=1,dryRun=false}){
     your_phone:process.env.YOUR_PHONE||'',
     your_website:process.env.YOUR_WEBSITE||''
   });
-  if(dryRun){dbLog('👁','DRY RUN',`To:${contact.email}|${subject}`);return{ok:true,dryRun:true,subject,body};}
+  if(dryRun){await dbLog('👁','DRY RUN',`To:${contact.email}|${subject}`);return{ok:true,dryRun:true,subject,body};}
   try{
     const info = await makeTransport().sendMail({
       from:`"${process.env.SMTP_FROM_NAME}"<${process.env.SMTP_USER}>`,
@@ -76,10 +132,10 @@ async function sendEmail({contact,lead,emailNum=1,dryRun=false}){
     });
     insertEmail({contact_id:contact.id,lead_id:lead.id||contact.lead_id,direction:'out',subject,body,from_addr:process.env.SMTP_USER,to_addr:contact.email,template_num:emailNum,message_id:info.messageId});
     markContactSent(contact.id);
-    dbLog('📤',`Email #${emailNum} sent`,`${lead.company}→${contact.name}`);
+    await dbLog('📤',`Email #${emailNum} sent`,`${lead.company}→${contact.name}`);
     return{ok:true,messageId:info.messageId};
   }catch(e){
-    dbLog('❌','Send failed',e.message);
+    await dbLog('❌','Send failed',e.message);
     return{ok:false,error:e.message};
   }
 }
@@ -140,16 +196,16 @@ async function findCompanyWebsite(companyName){
 
 async function enrichContactsWithHunter(){
   const key = process.env.HUNTER_API_KEY;
-  if(!key){ dbLog('⚠️','Hunter skipped','HUNTER_API_KEY not set'); return 0; }
+  if(!key){ await dbLog('⚠️','Hunter skipped','HUNTER_API_KEY not set'); return 0; }
 
-  const contacts = db.get('contacts').filter(c=>!c.email).value();
+  const contacts = (await db.execute("SELECT c.*,l.website,l.company as lead_company FROM contacts c JOIN leads l ON l.id=c.lead_id WHERE c.email IS NULL")).rows.map(c=>({...c,id:Number(c.id),lead_id:Number(c.lead_id),emails_sent:Number(c.emails_sent)||0}));
   let found = 0;
   let searched = 0;
   const HUNTER_DAILY_LIMIT = 20; // stay well within free 25/month
 
   for(const c of contacts){
     if(searched >= HUNTER_DAILY_LIMIT) break;
-    const lead = getLeadById(c.lead_id);
+    const lead = await getLeadById(c.lead_id);
     if(!lead) continue;
 
     // Get domain — from website field, guess from name, or look up via Serper
@@ -165,7 +221,7 @@ async function enrichContactsWithHunter(){
       if(searched < 5 && process.env.SERPER_API_KEY){
         const found = await findCompanyWebsite(lead.company);
         domain = found || guessed;
-        if(found) db.get('leads').find({id:lead.id}).assign({website:'https://'+found}).write();
+        if(found) await db.execute({sql:'UPDATE leads SET website=? WHERE id=?',args:['https://'+found,lead.id]});
       } else {
         domain = guessed;
       }
@@ -185,21 +241,21 @@ async function enrichContactsWithHunter(){
       const domainEmails = await findEmailsByDomain(domain);
       if(domainEmails.length>0){
         email = domainEmails[0].value; // use first email found on domain
-        dbLog('🔍','Hunter domain fallback',`${lead.company} → ${email}`);
+        await dbLog('🔍','Hunter domain fallback',`${lead.company} → ${email}`);
       }
     }
 
     if(email){
       updateContactEmail(c.id, email);
       found++;
-      dbLog('🎯','Hunter email found',`${c.name} at ${lead.company} → ${email}`);
+      await dbLog('🎯','Hunter email found',`${c.name} at ${lead.company} → ${email}`);
     } else {
-      dbLog('🔍','Hunter no result',`${lead.company} (${domain})`);
+      await dbLog('🔍','Hunter no result',`${lead.company} (${domain})`);
     }
     await new Promise(r=>setTimeout(r,1200));
   }
 
-  dbLog('🔍','Hunter enrichment done',`${found} emails found from ${searched} searches`);
+  await dbLog('🔍','Hunter enrichment done',`${found} emails found from ${searched} searches`);
   return found;
 }
 
@@ -276,28 +332,31 @@ async function importFromCSV(buffer){
 
   for(const [coKey, {company,website,industry,location,source,people}] of Object.entries(byCompany)){
     // Skip duplicate companies — just add new contacts
-    const exists = db.get('leads').find(l=>l.company.toLowerCase().trim()===coKey).value();
+    const existsR = await db.execute({sql:'SELECT * FROM leads WHERE LOWER(TRIM(company))=LOWER(TRIM(?))',args:[coKey]});
+    const exists = existsR.rows[0]||null;
     if(exists){
       for(const p of people.slice(0,maxContacts)){
-        const dup = db.get('contacts').find(c=>c.lead_id===exists.id&&c.name===p.name).value();
-        if(!dup){ insertContact({lead_id:exists.id,name:p.name,first_name:p.firstName||p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null}); contactsAdded++; }
+        const dupR = await db.execute({sql:'SELECT id FROM contacts WHERE lead_id=? AND name=?',args:[exists.id,p.name]});
+          const dup = dupR.rows[0]||null;
+        if(!dup){ await insertContact({lead_id:exists.id,name:p.name,first_name:p.firstName||p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null}); contactsAdded++; }
       }
       continue;
     }
-    const r = insertLead({company,website,industry,size:null,location,source,notes:`Imported from ${source==='waalaxy'?'Waalaxy':'Apollo.io'} CSV`});
+    const r = await insertLead({company,website,industry,size:null,location,source,notes:`Imported from ${source==='waalaxy'?'Waalaxy':'Apollo.io'} CSV`});
     leadsAdded++;
     for(const p of people.slice(0,maxContacts)){
-      insertContact({lead_id:r.lastInsertRowid,name:p.name,first_name:p.firstName||p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null});
+      await insertContact({lead_id:r.lastInsertRowid,name:p.name,first_name:p.firstName||p.name.split(' ')[0]||'there',role:p.role,email:p.email||null,linkedin:p.linkedin||null});
       contactsAdded++;
     }
   }
 
-  dbLog('📋',`CSV import complete (${rows[0]&&'First name' in rows[0]?'Waalaxy':'Apollo'} format)`,`${leadsAdded} companies, ${contactsAdded} contacts, ${skipped} skipped`);
+  await dbLog('📋',`CSV import complete (${rows[0]&&'First name' in rows[0]?'Waalaxy':'Apollo'} format)`,`${leadsAdded} companies, ${contactsAdded} contacts, ${skipped} skipped`);
   return{leadsAdded,contactsAdded,skipped,total:rows.length};
 }
 
 // ── Reply watcher ─────────────────────────────────────────────────────────
-async function checkForReplies(){return new Promise(resolve=>{const imap=new Imap({user:process.env.SMTP_USER,password:process.env.SMTP_PASS,host:process.env.IMAP_HOST||'imap.hostinger.com',port:993,tls:true,tlsOptions:{rejectUnauthorized:false},connTimeout:15000,authTimeout:15000});let found=0;imap.once('ready',()=>{imap.openBox('INBOX',false,(err)=>{if(err){imap.end();return resolve(0);}const since=new Date();since.setDate(since.getDate()-30);imap.search(['UNSEEN',['SINCE',since.toLocaleDateString('en-US',{month:'short',day:'2-digit',year:'numeric'})]],async(err,uids)=>{if(err||!uids?.length){imap.end();return resolve(0);}const fetch=imap.fetch(uids,{bodies:'',markSeen:false});const promises=[];fetch.on('message',msg=>{const p=new Promise(res=>{let buf='';msg.on('body',s=>s.on('data',d=>buf+=d.toString()));msg.once('end',async()=>{try{const parsed=await simpleParser(buf);const fe=parsed.from?.value?.[0]?.address?.toLowerCase();if(!fe)return res();const contact=db.get('contacts').filter(c=>c.email&&c.email.toLowerCase()===fe).value()[0];if(contact&&contact.status!=='replied'){found++;markContactReplied(contact.id);const lead=getLeadById(contact.lead_id);insertEmail({contact_id:contact.id,lead_id:contact.lead_id,direction:'in',subject:parsed.subject||'',body:parsed.text||'',from_addr:fe,to_addr:process.env.SMTP_USER,template_num:null,message_id:parsed.messageId||null});dbLog('💬','REPLY!',`${lead?.company}—${contact.name}`);await sendNotif({contactName:contact.name,companyName:lead?.company||'',replyBody:(parsed.text||'').substring(0,500)});}}catch(e){}res();});});promises.push(p);});fetch.once('end',async()=>{await Promise.all(promises);imap.end();resolve(found);});});});});imap.once('error',()=>resolve(0));imap.once('end',()=>{});imap.connect();});}
+async function checkForReplies(){return new Promise(resolve=>{const imap=new Imap({user:process.env.SMTP_USER,password:process.env.SMTP_PASS,host:process.env.IMAP_HOST||'imap.hostinger.com',port:993,tls:true,tlsOptions:{rejectUnauthorized:false},connTimeout:15000,authTimeout:15000});let found=0;imap.once('ready',()=>{imap.openBox('INBOX',false,(err)=>{if(err){imap.end();return resolve(0);}const since=new Date();since.setDate(since.getDate()-30);imap.search(['UNSEEN',['SINCE',since.toLocaleDateString('en-US',{month:'short',day:'2-digit',year:'numeric'})]],async(err,uids)=>{if(err||!uids?.length){imap.end();return resolve(0);}const fetch=imap.fetch(uids,{bodies:'',markSeen:false});const promises=[];fetch.on('message',msg=>{const p=new Promise(res=>{let buf='';msg.on('body',s=>s.on('data',d=>buf+=d.toString()));msg.once('end',async()=>{try{const parsed=await simpleParser(buf);const fe=parsed.from?.value?.[0]?.address?.toLowerCase();if(!fe)return res();const contactRes=await db.execute({sql:'SELECT * FROM contacts WHERE LOWER(email)=?',args:[fe]});
+              const contact=contactRes.rows[0]||null;if(contact&&contact.status!=='replied'){found++;markContactReplied(contact.id);const lead=await getLeadById(contact.lead_id);insertEmail({contact_id:contact.id,lead_id:contact.lead_id,direction:'in',subject:parsed.subject||'',body:parsed.text||'',from_addr:fe,to_addr:process.env.SMTP_USER,template_num:null,message_id:parsed.messageId||null});await dbLog('💬','REPLY!',`${lead?.company}—${contact.name}`);await sendNotif({contactName:contact.name,companyName:lead?.company||'',replyBody:(parsed.text||'').substring(0,500)});}}catch(e){}res();});});promises.push(p);});fetch.once('end',async()=>{await Promise.all(promises);imap.end();resolve(found);});});});});imap.once('error',()=>resolve(0));imap.once('end',()=>{});imap.connect();});}
 
 // ── Job Board Scrapers (RSS + Public APIs — no bot blocking) ─────────────
 
@@ -306,9 +365,6 @@ function extractDomain(url=''){
   catch(e){ return ''; }
 }
 
-function leadExists(company){
-  return !!db.get('leads').find(l=>l.company.toLowerCase().trim()===company.toLowerCase().trim()).value();
-}
 
 // ── 1. Indeed RSS (most reliable — official feed) ────────────────────────
 async function scrapeIndeed(){
@@ -364,7 +420,7 @@ async function scrapeIndeed(){
     }catch(e){}
     await new Promise(r=>setTimeout(r,1500));
   }
-  dbLog('💼','Indeed RSS',`${results.length} job posts found`);
+  await dbLog('💼','Indeed RSS',`${results.length} job posts found`);
   return results;
 }
 
@@ -396,8 +452,8 @@ async function scrapeHNHiring(){
         }
       }
     }
-    dbLog('🔶','HackerNews Hiring',`${results.length} companies found`);
-  }catch(e){ dbLog('⚠️','HN error',e.message); }
+    await dbLog('🔶','HackerNews Hiring',`${results.length} companies found`);
+  }catch(e){ await dbLog('⚠️','HN error',e.message); }
   return results;
 }
 
@@ -416,8 +472,8 @@ async function scrapeYC(){
         if(relevant) results.push({company, source:'ycombinator', notes:`YC Jobs: ${text.substring(0,80)}`});
       }
     }
-    dbLog('🚀','YC Jobs',`${results.length} companies found`);
-  }catch(e){ dbLog('⚠️','YC error',e.message); }
+    await dbLog('🚀','YC Jobs',`${results.length} companies found`);
+  }catch(e){ await dbLog('⚠️','YC error',e.message); }
   return results;
 }
 
@@ -462,10 +518,10 @@ async function scrapeRemoteOK(){
         });
       }
     }
-    dbLog('🌍','RemoteOK JSON',`${results.length} companies found`);
+    await dbLog('🌍','RemoteOK JSON',`${results.length} companies found`);
     return results;
   }catch(e){
-    dbLog('⚠️','RemoteOK JSON failed',`${e.response?.status||e.message} — trying RSS fallback`);
+    await dbLog('⚠️','RemoteOK JSON failed',`${e.response?.status||e.message} — trying RSS fallback`);
   }
 
   // Fallback: RemoteOK RSS feed (no auth, rarely blocked)
@@ -495,8 +551,8 @@ async function scrapeRemoteOK(){
         await new Promise(r=>setTimeout(r,800));
       }catch(e){}
     }
-    dbLog('🌍','RemoteOK RSS fallback',`${results.length} companies found`);
-  }catch(e){ dbLog('⚠️','RemoteOK RSS also failed',e.message); }
+    await dbLog('🌍','RemoteOK RSS fallback',`${results.length} companies found`);
+  }catch(e){ await dbLog('⚠️','RemoteOK RSS also failed',e.message); }
 
   return results;
 }
@@ -536,38 +592,13 @@ async function scrapeGreenhouse(){
     }catch(e){}
     await new Promise(r=>setTimeout(r,500));
   }
-  dbLog('🌱','Greenhouse',`${results.length} companies actively hiring`);
+  await dbLog('🌱','Greenhouse',`${results.length} companies actively hiring`);
   return results;
 }
 
 // ── Serper daily credit guard ─────────────────────────────────────────────
 // Tracks how many Serper queries were fired today. Max 2 per run × 2 runs/day
 // = 4 queries/day × 10 results = ~40 leads/day. Hard cap at 50 leads/day.
-const SERPER_MAX_LEADS_PER_DAY = parseInt(process.env.SERPER_MAX_LEADS_DAY)||50;
-const SERPER_QUERIES_PER_RUN   = 1; // 1 credit/day → 2,500 days of free credits (~7 years)
-
-function serperFiredToday(){
-  const today = new Date().toISOString().slice(0,10);
-  const rec = db.get('_serperDaily').value();
-  return rec && rec.date===today && rec.fired===true;
-}
-function markSerperFiredToday(){
-  const today = new Date().toISOString().slice(0,10);
-  const rec = db.get('_serperDaily').value()||{};
-  db.set('_serperDaily',{...rec, date:today, fired:true}).write();
-}
-function getSerperDailyCount(){
-  const today = new Date().toISOString().slice(0,10); // YYYY-MM-DD
-  const rec = db.get('_serperDaily').value();
-  if(!rec||rec.date!==today) return 0;
-  return rec.count||0;
-}
-function addSerperDailyCount(n){
-  const today = new Date().toISOString().slice(0,10);
-  const rec = db.get('_serperDaily').value();
-  const current = (rec&&rec.date===today) ? (rec.count||0) : 0;
-  db.set('_serperDaily',{date:today, count:current+n}).write();
-}
 
 // ── 6. Serper.dev Search API — Remote-only, 50 leads/day cap ─────────────
 async function scrapeGoogleCustom(){
@@ -575,15 +606,15 @@ async function scrapeGoogleCustom(){
   if(!key) return [];
 
   // ── Once-per-day guard — 1 query/day = 2,500 days of free credits ────
-  if(serperFiredToday()){
-    dbLog('⏸️','Serper skipped','Already used today\'s 1 query — resets at midnight');
+  if(await serperFiredToday()){
+    await dbLog('⏸️','Serper skipped','Already used today\'s 1 query — resets at midnight');
     return [];
   }
 
   // ── Daily lead cap check ──────────────────────────────────────────────
-  const todayCount = getSerperDailyCount();
+  const todayCount = await getSerperDailyCount();
   if(todayCount >= SERPER_MAX_LEADS_PER_DAY){
-    dbLog('⏸️','Serper skipped',`Daily cap of ${SERPER_MAX_LEADS_PER_DAY} leads already reached`);
+    await dbLog('⏸️','Serper skipped',`Daily cap of ${SERPER_MAX_LEADS_PER_DAY} leads already reached`);
     return [];
   }
   const remainingSlots = SERPER_MAX_LEADS_PER_DAY - todayCount;
@@ -617,7 +648,7 @@ async function scrapeGoogleCustom(){
     todayQueries.push(allQueries[(idx+i) % allQueries.length]);
   }
 
-  dbLog('🔎','Serper Search',`${todayQueries.length} queries | ${todayCount}/${SERPER_MAX_LEADS_PER_DAY} leads used today`);
+  await dbLog('🔎','Serper Search',`${todayQueries.length} queries | ${todayCount}/${SERPER_MAX_LEADS_PER_DAY} leads used today`);
 
   for(const q of todayQueries){
     if(results.length >= remainingSlots) break; // stop if daily cap would be hit
@@ -710,27 +741,27 @@ async function scrapeGoogleCustom(){
           });
         }
       }
-      dbLog('🔎','Serper query done',`"${q.substring(0,50)}" → ${results.length} remote leads so far`);
+      await dbLog('🔎','Serper query done',`"${q.substring(0,50)}" → ${results.length} remote leads so far`);
     }catch(e){
       if(e.response&&(e.response.status===429||e.response.status===403)){
-        dbLog('⚠️','Serper quota reached','Credit limit hit — check serper.dev dashboard');
+        await dbLog('⚠️','Serper quota reached','Credit limit hit — check serper.dev dashboard');
         break;
       }
-      dbLog('⚠️','Serper error',e.message);
+      await dbLog('⚠️','Serper error',e.message);
     }
     await new Promise(r=>setTimeout(r,1200));
   }
 
   // Track how many leads we found today + mark as fired
-  if(results.length>0) addSerperDailyCount(results.length);
-  markSerperFiredToday();
+  if(results.length>0) await addSerperDailyCount(results.length);
+  await markSerperFiredToday();
 
-  dbLog('🔎','Serper done',`${results.length} remote IT leads found | ${getSerperDailyCount()}/${SERPER_MAX_LEADS_PER_DAY} today`);
+  await dbLog('🔎','Serper done',`${results.length} remote IT leads found | ${await getSerperDailyCount()}/${SERPER_MAX_LEADS_PER_DAY} today`);
   return results;
 }
 // ── Master scraper ────────────────────────────────────────────────────────
 async function scrapeAllJobBoards(){
-  dbLog('🌐','Job scrape started','Indeed RSS + HackerNews + YC + RemoteOK + Greenhouse + Serper (remote only)');
+  await dbLog('🌐','Job scrape started','Indeed RSS + HackerNews + YC + RemoteOK + Greenhouse + Serper (remote only)');
 
   const [indeed, hn, yc, remote, greenhouse, google] = await Promise.allSettled([
     scrapeIndeed(),
@@ -750,16 +781,17 @@ async function scrapeAllJobBoards(){
     ...(google.value||[]),
   ];
 
-  // Deduplicate
+  // Deduplicate — check existing leads in DB
   const seen = new Set();
-  const unique = all.filter(r=>{
+  const existingCheck = await Promise.all(all.map(r=>leadExists(r.company)));
+  const unique = all.filter((r,i)=>{
     const key = r.company.toLowerCase().trim();
-    if(!key||key.length<2||seen.has(key)||leadExists(r.company)) return false;
+    if(!key||key.length<2||seen.has(key)||existingCheck[i]) return false;
     seen.add(key);
     return true;
   });
 
-  dbLog('📊','Scrape complete',`${all.length} total → ${unique.length} new unique companies`);
+  await dbLog('📊','Scrape complete',`${all.length} total → ${unique.length} new unique companies`);
 
   let added = 0;
   for(const co of unique){
@@ -773,13 +805,13 @@ async function scrapeAllJobBoards(){
       co.date_posted ? `Posted: ${co.date_posted}` : '',
     ].filter(Boolean).join('\n');
 
-    const r = insertLead({
+    const r = await insertLead({
       company:co.company, website:co.website||null,
       industry:'Technology', size:null,
       location:co.location||'USA', source:co.source,
       notes:jobDetails,
     });
-    insertContact({
+    await insertContact({
       lead_id:r.lastInsertRowid, name:'Unknown',
       first_name:'there', role:'CTO / HR Manager',
       email:null, linkedin:null,
@@ -787,23 +819,21 @@ async function scrapeAllJobBoards(){
     added++;
   }
 
-  dbLog('✅','Import done',`${added} new companies added`);
+  await dbLog('✅','Import done',`${added} new companies added`);
   return {total:all.length, unique:unique.length, added};
 }
 
 // ── Agent ─────────────────────────────────────────────────────────────────
 let agentRunning=false;
-async function runAgentCycle({dryRun=false}={}){if(agentRunning)return;agentRunning=true;dbLog('⚡','Agent started',dryRun?'DRY RUN':'LIVE');try{const r=await checkForReplies();if(r>0)dbLog('🎉',`${r} replies`,'');// Scrape job boards for new leads
-try{await scrapeAllJobBoards();}catch(e){dbLog('⚠️','Scraper error',e.message);}// Try Hunter.io email enrichment
-try{await scrapeAllJobBoards();}catch(e){dbLog('⚠️','Scraper error',e.message);}try{const hunterFound=await enrichContactsWithHunter();if(hunterFound>0)dbLog('🔍','Hunter enrichment',`${hunterFound} emails found`);}catch(e){}
-const nc=getContactsNotYetEmailed();let sent=0;const max=parseInt(process.env.MAX_EMAILS_PER_DAY)||30;for(const c of nc){if(sent>=max)break;const l=getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:1,dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}const fc=getContactsDueForFollowup();for(const c of fc){if(sent>=max)break;const l=getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:Math.min(c.emails_sent+1,4),dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}dbLog('✅','Cycle done',`${sent} emails`);}catch(e){dbLog('❌','Agent error',e.message);}finally{agentRunning=false;}}
+async function runAgentCycle({dryRun=false}={}){if(agentRunning)return;agentRunning=true;await dbLog('⚡','Agent started',dryRun?'DRY RUN':'LIVE');try{const r=await checkForReplies();if(r>0)await dbLog('🎉',`${r} replies`,'');// Scrape job boards for new leads
+try{await scrapeAllJobBoards();}catch(e){await dbLog('⚠️','Scraper error',e.message);}try{const hunterFound=await enrichContactsWithHunter();if(hunterFound>0)await dbLog('🔍','Hunter enrichment',`${hunterFound} emails found`);}catch(e){}
+const nc=await getContactsNotYetEmailed();let sent=0;const max=parseInt(process.env.MAX_EMAILS_PER_DAY)||30;for(const c of nc){if(sent>=max)break;const l=await getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:1,dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}const fc=await getContactsDueForFollowup();for(const c of fc){if(sent>=max)break;const l=await getLeadById(c.lead_id);if(!l)continue;const res=await sendEmail({contact:c,lead:l,emailNum:Math.min(c.emails_sent+1,4),dryRun});if(res.ok)sent++;if(!dryRun)await delay(parseInt(process.env.EMAIL_DELAY_SECONDS)||90);}await dbLog('✅','Cycle done',`${sent} emails`);}catch(e){await dbLog('❌','Agent error',e.message);}finally{agentRunning=false;}}
 function startScheduler(){
-  // Optimal BD sending times — Tue-Thu 10am & 2pm EST = 15:00 & 19:00 UTC
-  cron.schedule('0 15 * * 2-4',()=>runAgentCycle()); // 10am EST Tue-Thu
-  cron.schedule('0 19 * * 2-4',()=>runAgentCycle()); // 2pm EST Tue-Thu
-  cron.schedule('0 14 * * 1',()=>runAgentCycle());   // Monday 9am EST
-  cron.schedule('0 6 * * 1-5',()=>scrapeAllJobBoards().catch(console.error)); // 6am scrape
-  cron.schedule('*/15 * * * *',()=>checkForReplies()); // replies every 15min
+  cron.schedule('0 15 * * 2-4',()=>runAgentCycle());
+  cron.schedule('0 19 * * 2-4',()=>runAgentCycle());
+  cron.schedule('0 14 * * 1',()=>runAgentCycle());
+  cron.schedule('0 6 * * 1-5',()=>scrapeAllJobBoards().catch(console.error));
+  cron.schedule('*/15 * * * *',()=>checkForReplies());
   dbLog('📅','Scheduler active','Tue-Thu 10am+2pm EST | Mon 9am | Scrape 6am | Replies 15min');
 }
 
@@ -813,22 +843,22 @@ app.use(cors());
 app.use(express.json());
 
 app.get('/healthz',(req,res)=>res.status(200).send('OK'));
-app.get('/api/stats',(req,res)=>res.json(getStats()));
-app.get('/api/leads',(req,res)=>res.json(getAllLeads()));
-app.get('/api/leads/:id',(req,res)=>{const l=getLeadById(req.params.id);if(!l)return res.status(404).json({error:'Not found'});res.json({...l,contacts:getContactsByLeadId(l.id),thread:getEmailsByLeadId(l.id)});});
-app.post('/api/leads',(req,res)=>{const{company,website,industry,size,location,source,notes,contacts}=req.body;if(!company)return res.status(400).json({error:'company required'});const r=insertLead({company,website,industry,size,location,source:source||'manual',notes});const lid=r.lastInsertRowid;if(contacts?.length)for(const c of contacts)if(c.name||c.email)insertContact({lead_id:lid,name:c.name||'Unknown',first_name:c.name?.split(' ')[0]||'there',role:c.role||'',email:c.email||null,linkedin:c.linkedin||null});dbLog('➕','Lead added',company);res.json({ok:true,id:lid});});
-app.delete('/api/leads/:id',(req,res)=>{db.get('leads').remove({id:Number(req.params.id)}).write();res.json({ok:true});});
-app.patch('/api/contacts/:id/email',(req,res)=>{updateContactEmail(req.params.id,req.body.email);res.json({ok:true});});
-app.patch('/api/contacts/:id/replied',(req,res)=>{markContactReplied(req.params.id);res.json({ok:true});});
-app.post('/api/contacts/:id/send',async(req,res)=>{const c=getContactById(req.params.id);if(!c)return res.status(404).json({error:'Not found'});if(!c.email)return res.status(400).json({error:'No email'});const l=getLeadById(c.lead_id);res.json(await sendEmail({contact:c,lead:l,emailNum:c.emails_sent+1}));});
-app.get('/api/activity',(req,res)=>res.json(getRecentActivity(parseInt(req.query.limit)||50)));
+app.get('/api/stats',async(req,res)=>res.json(await getStats()));
+app.get('/api/leads',async(req,res)=>res.json(await getAllLeads()));
+app.get('/api/leads/:id',async(req,res)=>{const l=await getLeadById(req.params.id);if(!l)return res.status(404).json({error:'Not found'});const[contacts,thread]=await Promise.all([getContactsByLeadId(l.id),getEmailsByLeadId(l.id)]);res.json({...l,contacts,thread});});
+app.post('/api/leads',async(req,res)=>{const{company,website,industry,size,location,source,notes,contacts}=req.body;if(!company)return res.status(400).json({error:'company required'});const r=await insertLead({company,website,industry,size,location,source:source||'manual',notes});const lid=r.lastInsertRowid;if(contacts?.length)for(const c of contacts)if(c.name||c.email)await insertContact({lead_id:lid,name:c.name||'Unknown',first_name:c.name?.split(' ')[0]||'there',role:c.role||'',email:c.email||null,linkedin:c.linkedin||null});await dbLog('➕','Lead added',company);res.json({ok:true,id:lid});});
+app.delete('/api/leads/:id',async(req,res)=>{await db.execute({sql:'DELETE FROM leads WHERE id=?',args:[Number(req.params.id)]});await db.execute({sql:'DELETE FROM contacts WHERE lead_id=?',args:[Number(req.params.id)]});res.json({ok:true});});
+app.patch('/api/contacts/:id/email',async(req,res)=>{await updateContactEmail(req.params.id,req.body.email);res.json({ok:true});});
+app.patch('/api/contacts/:id/replied',async(req,res)=>{await markContactReplied(req.params.id);res.json({ok:true});});
+app.post('/api/contacts/:id/send',async(req,res)=>{const c=await getContactById(req.params.id);if(!c)return res.status(404).json({error:'Not found'});if(!c.email)return res.status(400).json({error:'No email'});const l=await getLeadById(c.lead_id);res.json(await sendEmail({contact:c,lead:l,emailNum:c.emails_sent+1}));});
+app.get('/api/activity',async(req,res)=>res.json(await getRecentActivity(parseInt(req.query.limit)||50)));
 // ── Gemini AI Personalised Email ─────────────────────────────────────────
 app.post('/api/ai/generate-email',async(req,res)=>{
   const key = process.env.GEMINI_API_KEY;
   if(!key) return res.json({ok:false,error:'GEMINI_API_KEY not set in Railway'});
 
   const {lead_id,contact_id,email_num=1} = req.body;
-  const lead = getLeadById(lead_id);
+  const lead = await getLeadById(lead_id);
   if(!lead) return res.status(404).json({error:'Lead not found'});
   const contacts = getContactsByLeadId(lead_id);
   const contact = contact_id ? contacts.find(c=>c.id===Number(contact_id)) : contacts[0];
@@ -876,10 +906,10 @@ Respond ONLY with valid JSON, no markdown, no extra text: {"subject":"...","body
     const clean = raw.replace(/```json|```/g,'').trim();
     const parsed = JSON.parse(clean);
     if(!parsed.subject||!parsed.body) throw new Error('Gemini returned incomplete JSON');
-    dbLog('🤖','Gemini email generated',`${lead.company} — email #${email_num}`);
+    await dbLog('🤖','Gemini email generated',`${lead.company} — email #${email_num}`);
     res.json({ok:true, subject:parsed.subject, body:parsed.body});
   }catch(e){
-    dbLog('❌','Gemini failed',e.response?.data?.error?.message||e.message);
+    await dbLog('❌','Gemini failed',e.response?.data?.error?.message||e.message);
     res.json({ok:false, error:e.response?.data?.error?.message||e.message});
   }
 });
@@ -974,7 +1004,7 @@ app.post('/api/hunter/enrich',async(req,res)=>{
 app.post('/webhook/waalaxy', async(req,res)=>{
   try{
     const data = req.body;
-    dbLog('🔗','Waalaxy webhook received', JSON.stringify(data).substring(0,100));
+    await dbLog('🔗','Waalaxy webhook received', JSON.stringify(data).substring(0,100));
 
     // Waalaxy sends prospect data in various formats — handle all of them
     const prospects = data.prospects || data.leads || (Array.isArray(data)?data:[data]);
@@ -996,10 +1026,11 @@ app.post('/webhook/waalaxy', async(req,res)=>{
 
       // Find or create the lead (company)
       const coName = company || `${name}'s Company`;
-      let lead = db.get('leads').find(l=>l.company.toLowerCase().trim()===coName.toLowerCase().trim()).value();
+      const leadR = await db.execute({sql:'SELECT * FROM leads WHERE LOWER(TRIM(company))=LOWER(TRIM(?))',args:[coName]});
+      let lead = leadR.rows[0]||null; if(lead) lead={...lead,id:Number(lead.id)};
 
       if(!lead){
-        const r = insertLead({
+        const r = await insertLead({
           company:coName, website, industry:null,
           size:null, location, source:'waalaxy',
           notes:`LinkedIn connection accepted via Waalaxy`
@@ -1009,9 +1040,10 @@ app.post('/webhook/waalaxy', async(req,res)=>{
       }
 
       // Add contact if not already there
-      const exists = db.get('contacts').find(c=>c.lead_id===lead.id&&c.name===name).value();
+      const existsC = await db.execute({sql:'SELECT id FROM contacts WHERE lead_id=? AND name=?',args:[lead.id,name]});
+      const exists = existsC.rows[0]||null;
       if(!exists){
-        insertContact({
+        await insertContact({
           lead_id:lead.id, name, first_name:firstName||name.split(' ')[0]||'there',
           role, email:email||null, linkedin
         });
@@ -1019,27 +1051,28 @@ app.post('/webhook/waalaxy', async(req,res)=>{
 
       // If email provided by Waalaxy — start sequence immediately
       if(email){
-        dbLog('📤','Waalaxy lead ready to email',`${name} at ${coName} — ${email}`);
+        await dbLog('📤','Waalaxy lead ready to email',`${name} at ${coName} — ${email}`);
       } else {
-        dbLog('🔍','Waalaxy lead needs email',`${name} at ${coName} — will search via Hunter`);
+        await dbLog('🔍','Waalaxy lead needs email',`${name} at ${coName} — will search via Hunter`);
         // Try Hunter.io to find email
         if(process.env.HUNTER_API_KEY && website){
           const domain = website.replace(/^https?:\/\//,'').replace(/\/.*/,'');
           const hunterEmail = await findEmailHunter(firstName, lastName, domain);
           if(hunterEmail){
-            const contact = db.get('contacts').find(c=>c.lead_id===lead.id&&c.name===name).value();
+            const contactR = await db.execute({sql:'SELECT * FROM contacts WHERE lead_id=? AND name=?',args:[lead.id,name]});
+          const contact = contactR.rows[0]||null;
             if(contact) updateContactEmail(contact.id, hunterEmail);
-            dbLog('🎯','Email found via Hunter',`${name} → ${hunterEmail}`);
+            await dbLog('🎯','Email found via Hunter',`${name} → ${hunterEmail}`);
           }
         }
       }
     }
 
-    dbLog('✅','Waalaxy webhook processed',`${added} new companies added`);
+    await dbLog('✅','Waalaxy webhook processed',`${added} new companies added`);
     res.json({ok:true, added, message:'Prospects received and queued for outreach'});
 
   }catch(e){
-    dbLog('❌','Waalaxy webhook error',e.message);
+    await dbLog('❌','Waalaxy webhook error',e.message);
     res.json({ok:false, error:e.message});
   }
 });
@@ -1056,11 +1089,16 @@ app.get('/webhook/waalaxy/test',(req,res)=>{
 
 
 const PORT=process.env.PORT||3000;
-app.listen(PORT,'0.0.0.0',()=>{
-  console.log(`\n🚀 LeadForge running on port ${PORT}`);
-  console.log(`📋 CSV upload: POST /api/import/csv`);
-  console.log(`🎯 Hunter enrich: POST /api/hunter/enrich`);
-  console.log(`✅ Test: /healthz /api/stats /api/test/gmail /api/test/hunter\n`);
-  startScheduler();
-  dbLog('🟢','Server started',`Port ${PORT}`);
+initDB().then(()=>{
+  app.listen(PORT,'0.0.0.0',()=>{
+    console.log(`\n🚀 LeadForge running on port ${PORT}`);
+    console.log(`📋 CSV upload: POST /api/import/csv`);
+    console.log(`🎯 Hunter enrich: POST /api/hunter/enrich`);
+    console.log(`✅ Tests: /api/test/hostinger /api/test/hunter /api/test/gemini /api/test/google\n`);
+    startScheduler();
+    dbLog('🟢','Server started',`Port ${PORT}`);
+  });
+}).catch(e=>{
+  console.error('❌ Failed to connect to Turso DB:',e.message);
+  process.exit(1);
 });
