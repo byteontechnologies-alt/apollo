@@ -5,7 +5,7 @@ const express=require('express'),cors=require('cors'),axios=require('axios'),nod
 const DATA_DIR=path.join(__dirname,'data');
 if(!fs.existsSync(DATA_DIR))fs.mkdirSync(DATA_DIR,{recursive:true});
 const db=low(new FileSync(path.join(DATA_DIR,'leadforge.json')));
-db.defaults({leads:[],contacts:[],emails:[],activity_log:[],_nextId:{leads:1,contacts:1,emails:1,activity_log:1}}).write();
+db.defaults({leads:[],contacts:[],emails:[],activity_log:[],_nextId:{leads:1,contacts:1,emails:1,activity_log:1},_serperDaily:{date:'',count:0}}).write();
 function nextId(t){const id=db.get(`_nextId.${t}`).value();db.set(`_nextId.${t}`,id+1).write();return id;}
 function getAllLeads(){return db.get('leads').value().map(l=>{const c=db.get('contacts').filter({lead_id:l.id}).value();return{...l,contact_count:c.length,total_sent:c.reduce((a,x)=>a+(x.emails_sent||0),0),has_reply:c.some(x=>x.status==='replied')?1:0};}).reverse();}
 function getLeadById(id){return db.get('leads').find({id:Number(id)}).value();}
@@ -283,11 +283,15 @@ async function scrapeIndeed(){
         const title   = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/s)||item.match(/<title>(.*?)<\/title>/s)||[])[1]||'';
         const desc    = (item.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>/s)||[])[1]||'';
         const link    = (item.match(/<link>(.*?)<\/link>/s)||[])[1]||'';
+        const text    = (title+' '+desc).toLowerCase();
+        // Remote only — skip on-site/hybrid
+        if(!/\bremote\b/.test(text)) continue;
+        if(/\bon.?site\b|\bin.?office\b|\bin.?person\b/.test(text)) continue;
         // Extract company from title: "Job Title - Company Name"
         const dashIdx = title.lastIndexOf(' - ');
         const company = dashIdx>0 ? title.substring(dashIdx+3).trim() : '';
         if(company && company.length>1 && company.length<60 && !company.toLowerCase().includes('indeed')){
-          results.push({company, source:'indeed', link, notes:`Indeed: hiring ${kw.replace('+',' ')}`});
+          results.push({company, source:'indeed', link, location:'Remote / USA', notes:`Indeed: hiring ${kw.replace('+',' ')} · Remote`});
         }
       }
     }catch(e){}
@@ -431,82 +435,138 @@ async function scrapeGreenhouse(){
   return results;
 }
 
-// ── 6. Google Custom Search API ──────────────────────────────────────────
+// ── Serper daily credit guard ─────────────────────────────────────────────
+// Tracks how many Serper queries were fired today. Max 2 per run × 2 runs/day
+// = 4 queries/day × 10 results = ~40 leads/day. Hard cap at 50 leads/day.
+const SERPER_MAX_LEADS_PER_DAY = parseInt(process.env.SERPER_MAX_LEADS_DAY)||50;
+const SERPER_QUERIES_PER_RUN   = 1; // 1 credit/day → 2,500 days of free credits (~7 years)
+
+function serperFiredToday(){
+  const today = new Date().toISOString().slice(0,10);
+  const rec = db.get('_serperDaily').value();
+  return rec && rec.date===today && rec.fired===true;
+}
+function markSerperFiredToday(){
+  const today = new Date().toISOString().slice(0,10);
+  const rec = db.get('_serperDaily').value()||{};
+  db.set('_serperDaily',{...rec, date:today, fired:true}).write();
+}
+  const today = new Date().toISOString().slice(0,10); // YYYY-MM-DD
+  const rec = db.get('_serperDaily').value();
+  if(!rec||rec.date!==today) return 0;
+  return rec.count||0;
+}
+function addSerperDailyCount(n){
+  const today = new Date().toISOString().slice(0,10);
+  const rec = db.get('_serperDaily').value();
+  const current = (rec&&rec.date===today) ? (rec.count||0) : 0;
+  db.set('_serperDaily',{date:today, count:current+n}).write();
+}
+
+// ── 6. Serper.dev Search API — Remote-only, 50 leads/day cap ─────────────
 async function scrapeGoogleCustom(){
-  const key = process.env.GOOGLE_SEARCH_KEY;
-  const cx  = process.env.GOOGLE_SEARCH_CX;
-  if(!key||!cx) return [];
+  const key = process.env.SERPER_API_KEY;
+  if(!key) return [];
+
+  // ── Once-per-day guard — 1 query/day = 2,500 days of free credits ────
+  if(serperFiredToday()){
+    dbLog('⏸️','Serper skipped','Already used today\'s 1 query — resets at midnight');
+    return [];
+  }
+
+  // ── Daily lead cap check ──────────────────────────────────────────────
+  const todayCount = getSerperDailyCount();
+  if(todayCount >= SERPER_MAX_LEADS_PER_DAY){
+    dbLog('⏸️','Serper skipped',`Daily cap of ${SERPER_MAX_LEADS_PER_DAY} leads already reached`);
+    return [];
+  }
+  const remainingSlots = SERPER_MAX_LEADS_PER_DAY - todayCount;
+
   const results = [];
 
-  // Broad IT outsourcing queries — any IT service, $20+/hr minimum
+  // ── Remote-only queries (all include "remote" keyword) ────────────────
+  // These are designed to return ONLY remote roles — no on-site, no hybrid
   const allQueries = [
-    // Direct outsourcing intent
-    '"looking for" "IT outsourcing" "$" site:linkedin.com',
-    '"looking to outsource" IT services company USA',
-    '"need IT support" outsource "$20" OR "$25" OR "$30" per hour',
-    '"managed IT services" "looking for" vendor partner USA',
-    '"IT staff augmentation" "looking for" provider USA',
-    // Developer roles $20+
-    '"hiring" developer "$20" OR "$25" OR "$30" OR "$35" OR "$40" per hour remote',
-    '"contract developer" "$" per hour remote USA 2025',
-    '"freelance developer" needed "$20" OR "$25" OR "$30" per hour',
-    // QA and Testing
-    '"QA engineer" OR "software tester" "$" per hour remote USA',
-    '"quality assurance" outsource "$20" per hour',
-    // DevOps and Cloud
-    '"DevOps engineer" OR "cloud engineer" "$" per hour remote contract',
-    '"AWS" OR "Azure" OR "GCP" engineer outsource "$" per hour USA',
-    // IT Support and Helpdesk
-    '"IT support" OR "helpdesk" outsource "$" per hour USA',
-    '"managed services" OR "IT helpdesk" vendor looking USA',
-    // Data and AI
-    '"data engineer" OR "data scientist" "$" per hour remote contract USA',
-    '"AI developer" OR "ML engineer" outsource "$" per hour',
-    // Project Management
-    '"IT project manager" OR "scrum master" "$" per hour contract remote',
-    // Cybersecurity
-    '"cybersecurity" OR "penetration testing" outsource "$" per hour USA',
-    // Mobile
-    '"mobile developer" OR "iOS developer" OR "Android developer" "$" per hour remote',
-    // LinkedIn posts about outsourcing
-    'site:linkedin.com/posts "looking to outsource" IT 2025',
-    'site:linkedin.com/posts "need IT services" outsource "$"',
-    'site:linkedin.com/posts "IT vendor" OR "IT partner" looking USA',
-    // Facebook groups
-    'site:facebook.com "IT outsourcing" "looking for" "$" per hour',
-    // General high intent
-    '"we are looking for" "IT services" vendor USA "$20" OR "$25" OR "$30"',
-    '"third party" IT services "looking for" USA company',
+    // Direct outsourcing intent — remote
+    '"IT outsourcing" "remote" "looking for" vendor USA',
+    '"IT staff augmentation" remote provider USA 2026',
+    '"managed IT services" remote vendor "looking for" USA',
+    // Developer hiring — remote contract only
+    '"hiring" "remote" developer contract "$" per hour USA',
+    '"remote" "contract developer" "$20" OR "$30" OR "$40" per hour USA',
+    '"remote" "full stack developer" contract outsource USA',
+    '"remote" "React developer" contract hiring USA 2026',
+    '"remote" "Node.js developer" contract "$" per hour',
+    '"remote" "Python developer" contract hiring USA',
+    // DevOps & Cloud — remote
+    '"remote" "DevOps engineer" contract "$" per hour USA',
+    '"remote" "AWS engineer" OR "cloud engineer" contract outsource',
+    // QA — remote
+    '"remote" "QA engineer" contract "$" per hour USA',
+    '"remote" "software tester" outsource "$" per hour',
+    // Data & AI — remote
+    '"remote" "data engineer" contract "$" per hour USA',
+    '"remote" "AI developer" OR "ML engineer" contract outsource',
+    // IT Support — remote
+    '"remote" "IT support" outsource "$" per hour USA',
+    '"remote" helpdesk outsource vendor USA',
+    // Cybersecurity — remote
+    '"remote" cybersecurity engineer contract "$" per hour USA',
+    // Mobile — remote
+    '"remote" "mobile developer" OR "iOS developer" contract "$" per hour',
+    // LinkedIn remote posts
+    'site:linkedin.com/posts "remote" "looking to outsource" IT 2026',
+    'site:linkedin.com/posts "remote" "IT vendor" OR "IT partner" USA',
+    // High intent — remote explicit
+    '"we are looking for" "remote" "IT services" vendor USA',
+    '"third party" "remote" IT services "looking for" USA',
+    '"outsource" "remote team" IT developer USA 2026',
   ];
 
-  // Use 5 queries per run (was 3) — still within 100/day limit
-  const day = new Date().getDate();
+  // Rotate through queries — 2 per run to preserve credits
+  // With 2 runs/day this = 4 credits/day → ~40 leads max (well under 50 cap)
+  const day  = new Date().getDate();
   const hour = new Date().getHours();
-  const idx = ((day * 5) + Math.floor(hour/8)) % allQueries.length;
+  const idx  = ((day * SERPER_QUERIES_PER_RUN) + Math.floor(hour/12)) % allQueries.length;
   const todayQueries = [];
-  for(let i=0; i<5; i++){
+  for(let i=0; i<SERPER_QUERIES_PER_RUN; i++){
     todayQueries.push(allQueries[(idx+i) % allQueries.length]);
   }
 
-  dbLog('🔎','Google Search', `Searching for IT outsourcing leads — ${todayQueries.length} queries`);
+  dbLog('🔎','Serper Search',`${todayQueries.length} queries | ${todayCount}/${SERPER_MAX_LEADS_PER_DAY} leads used today`);
 
   for(const q of todayQueries){
+    if(results.length >= remainingSlots) break; // stop if daily cap would be hit
+
     try{
-      const r = await axios.get('https://www.googleapis.com/customsearch/v1',{
-        params:{ key, cx, q, num:10 }, timeout:15000
-      });
-      const items = r.data?.items||[];
+      const r = await axios.post('https://google.serper.dev/search',
+        { q, num:10, gl:'us', hl:'en' },
+        { headers:{ 'X-API-KEY': key, 'Content-Type':'application/json' }, timeout:15000 }
+      );
+      const items = (r.data?.organic||[]).map(i=>({
+        title:   i.title||'',
+        link:    i.link||'',
+        snippet: i.snippet||''
+      }));
+
       for(const item of items){
+        if(results.length >= remainingSlots) break; // per-item cap check
+
         const title = item.title||'';
         const link  = item.link||'';
         const desc  = item.snippet||'';
         const text  = (title+' '+desc).toLowerCase();
 
-        // Skip if salary is below $20/hr
+        // ── REMOTE ONLY FILTER — skip anything not clearly remote ──────
+        const isRemote = /\bremote\b/.test(text);
+        const isOnsite = /\bon.?site\b|\bin.?office\b|\bon.?location\b|\bin.person\b/.test(text);
+        if(!isRemote || isOnsite) continue; // must say "remote" AND not say "on-site"
+
+        // Skip if salary is below $20/hr (when salary is mentioned)
         const salaryNums = (title+' '+desc).match(/\$(\d+)(?:\/hr|\/hour| per hour)/gi)||[];
         const salaryValues = salaryNums.map(s=>parseInt(s.replace(/\D/g,'')));
         const maxSalary = salaryValues.length>0 ? Math.max(...salaryValues) : null;
-        if(maxSalary !== null && maxSalary < 20) continue; // skip below $20/hr
+        if(maxSalary !== null && maxSalary < 20) continue;
 
         // Extract company name
         let company = '';
@@ -518,14 +578,9 @@ async function scrapeGoogleCustom(){
         company = company.trim().replace(/\.$/, '');
 
         if(company && company.length>2 && company.length<60){
-          // Extract salary range
           const salaryMatch = (title+' '+desc).match(/\$[\d,]+(?:\s*-\s*\$[\d,]+)?(?:\/hr|\/hour|k| per hour)?/i);
           const salary = salaryMatch ? salaryMatch[0] : '';
 
-          // Detect work type
-          const workType = text.includes('remote')?'Remote':text.includes('hybrid')?'Hybrid':'On-site';
-
-          // Detect IT service type
           const serviceTypes = [];
           if(text.match(/develop|engineer|programmer|coder/)) serviceTypes.push('Development');
           if(text.match(/qa|tester|quality/)) serviceTypes.push('QA');
@@ -539,32 +594,36 @@ async function scrapeGoogleCustom(){
           const serviceLabel = serviceTypes.length>0 ? serviceTypes.join(', ') : 'IT Services';
 
           results.push({
-            company, source:'google',
+            company, source:'serper',
             job_url: link,
             job_title: `${serviceLabel} — ${title.substring(0,60)}`,
             job_desc: desc.substring(0,250),
-            salary, location: workType+' / USA',
-            notes: `Google: ${title.substring(0,80)}${salary?' · '+salary:''}${workType?' · '+workType:''}`,
+            salary, location:'Remote / USA',
+            notes:`Serper: ${title.substring(0,80)}${salary?' · '+salary:''}· Remote`,
           });
         }
       }
-      dbLog('🔎','Google query done',`"${q.substring(0,50)}"`);
+      dbLog('🔎','Serper query done',`"${q.substring(0,50)}" → ${results.length} remote leads so far`);
     }catch(e){
-      if(e.response&&e.response.status===429){
-        dbLog('⚠️','Google quota reached','Daily limit hit — resets at midnight');
+      if(e.response&&(e.response.status===429||e.response.status===403)){
+        dbLog('⚠️','Serper quota reached','Credit limit hit — check serper.dev dashboard');
         break;
       }
-      dbLog('⚠️','Google error',e.message);
+      dbLog('⚠️','Serper error',e.message);
     }
-    await new Promise(r=>setTimeout(r,1000));
+    await new Promise(r=>setTimeout(r,1200));
   }
 
-  dbLog('🔎','Google done',`${results.length} IT outsourcing leads found`);
+  // Track how many leads we found today + mark as fired
+  if(results.length>0) addSerperDailyCount(results.length);
+  markSerperFiredToday();
+
+  dbLog('🔎','Serper done',`${results.length} remote IT leads found | ${getSerperDailyCount()}/${SERPER_MAX_LEADS_PER_DAY} today`);
   return results;
 }
 // ── Master scraper ────────────────────────────────────────────────────────
 async function scrapeAllJobBoards(){
-  dbLog('🌐','Job scrape started','Indeed RSS + HackerNews + YC + RemoteOK + Greenhouse');
+  dbLog('🌐','Job scrape started','Indeed RSS + HackerNews + YC + RemoteOK + Greenhouse + Serper (remote only)');
 
   const [indeed, hn, yc, remote, greenhouse, google] = await Promise.allSettled([
     scrapeIndeed(),
@@ -905,25 +964,24 @@ app.post('/api/import/csv', upload.single('file'), async(req,res)=>{
 // Hunter enrichment endpoint
 app.post('/api/scrape',async(req,res)=>{try{res.json({ok:true,...await scrapeAllJobBoards()});}catch(e){res.json({ok:false,error:e.message});}});
 
-// GET test for Google Search — open in browser to test
+// GET test for Serper Search — open in browser to test
 app.get('/api/test/google',async(req,res)=>{
-  const key = process.env.GOOGLE_SEARCH_KEY;
-  const cx  = process.env.GOOGLE_SEARCH_CX;
-  if(!key) return res.json({ok:false,error:'GOOGLE_SEARCH_KEY not set in Railway'});
-  if(!cx)  return res.json({ok:false,error:'GOOGLE_SEARCH_CX not set in Railway'});
+  const key = process.env.SERPER_API_KEY;
+  if(!key) return res.json({ok:false,error:'SERPER_API_KEY not set in Railway'});
   try{
-    const r = await axios.get('https://www.googleapis.com/customsearch/v1',{
-      params:{ key, cx, q:'React developer hiring USA', num:3 },
-      timeout:15000
-    });
-    const items = r.data?.items||[];
+    const r = await axios.post('https://google.serper.dev/search',
+      { q:'React developer hiring USA', num:3, gl:'us' },
+      { headers:{ 'X-API-KEY': key, 'Content-Type':'application/json' }, timeout:15000 }
+    );
+    const items = r.data?.organic||[];
     res.json({
       ok:true,
-      message:`Google Search working! Found ${items.length} results`,
+      message:`Serper Search working! Found ${items.length} results`,
+      credits_used: r.data?.credits||'N/A',
       sample: items.slice(0,2).map(i=>({title:i.title,link:i.link}))
     });
   }catch(e){
-    res.json({ok:false,error:e.response?.data?.error?.message||e.message, details:e.response?.data});
+    res.json({ok:false,error:e.response?.data?.message||e.message, details:e.response?.data});
   }
 });
 app.post('/api/scrape/indeed',async(req,res)=>{try{const r=await scrapeIndeed();res.json({ok:true,found:r.length});}catch(e){res.json({ok:false,error:e.message});}});
