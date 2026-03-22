@@ -121,6 +121,23 @@ async function findEmailsByDomain(domain){
     return r.data?.data?.emails || [];
   } catch(e) { return []; }
 }
+async function findCompanyWebsite(companyName){
+  const key = process.env.SERPER_API_KEY;
+  if(!key) return null;
+  try{
+    const r = await axios.post('https://google.serper.dev/search',
+      { q:`${companyName} official website`, num:1, gl:'us' },
+      { headers:{ 'X-API-KEY':key, 'Content-Type':'application/json' }, timeout:10000 }
+    );
+    const link = r.data?.organic?.[0]?.link||'';
+    if(!link) return null;
+    const domain = link.replace(/^https?:\/\//,'').replace(/\/.*/,'').replace(/^www\./,'');
+    // Skip generic sites
+    if(['linkedin','indeed','glassdoor','crunchbase','bloomberg','forbes','wikipedia'].some(s=>domain.includes(s))) return null;
+    return domain;
+  }catch(e){ return null; }
+}
+
 async function enrichContactsWithHunter(){
   const key = process.env.HUNTER_API_KEY;
   if(!key){ dbLog('⚠️','Hunter skipped','HUNTER_API_KEY not set'); return 0; }
@@ -135,15 +152,23 @@ async function enrichContactsWithHunter(){
     const lead = getLeadById(c.lead_id);
     if(!lead) continue;
 
-    // Get domain — from website field or guess from company name
+    // Get domain — from website field, guess from name, or look up via Serper
     let domain = '';
     if(lead.website){
       domain = lead.website.replace(/^https?:\/\//,'').replace(/\/.*/,'').replace(/^www\./,'');
     } else {
-      // Guess domain: "Stripe Inc" → "stripe.com"
-      domain = lead.company.toLowerCase()
+      // Guess first: "Stripe Inc" → "stripe.com"
+      const guessed = lead.company.toLowerCase()
         .replace(/[^a-z0-9 ]/g,'').replace(/\s+(inc|llc|corp|ltd|co|technologies|tech|solutions|services|group)$/,'')
         .trim().replace(/\s+/g,'')+'.com';
+      // Use Serper to verify/find real domain (costs 1 credit per lookup — limit to first 5)
+      if(searched < 5 && process.env.SERPER_API_KEY){
+        const found = await findCompanyWebsite(lead.company);
+        domain = found || guessed;
+        if(found) db.get('leads').find({id:lead.id}).assign({website:'https://'+found}).write();
+      } else {
+        domain = guessed;
+      }
     }
     if(!domain) continue;
 
@@ -843,7 +868,7 @@ Respond ONLY with valid JSON, no markdown, no extra text: {"subject":"...","body
 
   try{
     const r = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`,
       {contents:[{parts:[{text:prompt}]}]},
       {headers:{'Content-Type':'application/json'},timeout:25000}
     );
@@ -861,7 +886,8 @@ Respond ONLY with valid JSON, no markdown, no extra text: {"subject":"...","body
 
 app.post('/api/agent/run',async(req,res)=>{const d=req.body?.dry_run===true;runAgentCycle({dryRun:d}).catch(console.error);res.json({ok:true,message:d?'Dry run started':'Agent started'});});
 app.post('/api/agent/check-replies',async(req,res)=>res.json({ok:true,replies_found:await checkForReplies()}));
-app.get('/api/test/gmail',async(req,res)=>res.json(await testSmtp()));
+app.get('/api/test/hostinger',async(req,res)=>res.json(await testSmtp()));
+app.get('/api/test/gmail',async(req,res)=>res.json(await testSmtp())); // kept for backwards compat
 
 // Hunter.io test — shows exact credits remaining
 app.get('/api/test/hunter',async(req,res)=>{
@@ -888,13 +914,13 @@ app.get('/api/test/gemini',async(req,res)=>{
   if(!key) return res.json({ok:false,error:'GEMINI_API_KEY not set in Railway'});
   try{
     const r=await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`,
       {contents:[{parts:[{text:'Write a 2-sentence cold email subject line for an IT outsourcing company called ByteOn Technologies reaching out to Stripe who is hiring a remote React developer. Respond ONLY with JSON: {"subject":"...","body":"..."}'}]}]},
       {headers:{'Content-Type':'application/json'},timeout:20000}
     );
     const raw=r.data?.candidates?.[0]?.content?.parts?.[0]?.text||'{}';
     const parsed=JSON.parse(raw.replace(/```json|```/g,'').trim());
-    res.json({ok:true, message:'Gemini working!', model:'gemini-2.0-flash', sample_subject:parsed.subject, sample_body:parsed.body});
+    res.json({ok:true, message:'Gemini working!', model:'gemini-1.5-flash', sample_subject:parsed.subject, sample_body:parsed.body});
   }catch(e){
     res.json({ok:false, error:e.response?.data?.error?.message||e.message});
   }
